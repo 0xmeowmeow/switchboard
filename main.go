@@ -57,7 +57,7 @@ ai      | qwen        | chat with qwen 7b                  | ollama run qwen2.5:
 music   | cmus        | music player                       | cmus | keys: z prev, x play, c pause, v stop, b next, / search, tab switch, 1-4 views
 music   | tmus        | cmus + visualiser, three panes     | tmux kill-session -t music 2>/dev/null; tmux new-session -d -s music -x 200 -y 50 && tmux send-keys -t music "cmus" Enter && tmux split-window -t music -h "cava" && tmux split-window -t music -v "man cmus" && tmux attach -t music |
 
-system  | btconnect   | connect the bluetooth headphones   | bluetoothctl connect 88:0E:85:CC:FA:BB |
+system  | btconnect   | connect the bluetooth headphones   | bluetoothctl connect AA:BB:CC:DD:EE:FF |
 system  | hyprconf    | edit hyprland config               | nano ~/.config/hypr/hyprland.conf |
 system  | kittyconf   | edit kitty config                  | nano ~/.config/kitty/kitty.conf |
 system  | dotfiles    | dotfiles bare repo status          | git --git-dir=$HOME/.dotfiles --work-tree=$HOME status |
