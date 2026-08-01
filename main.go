@@ -1,5 +1,8 @@
 // switchboard — a launcher for the commands you forget you have.
 //
+// Layout: a group rail on the left, items on the right, a detail pane
+// underneath, a status bar at the bottom. Everything is lipgloss.
+//
 // Config: ~/.config/switchboard/commands.conf
 // Usage:  ~/.config/switchboard/usage.json   (written automatically)
 //
@@ -52,8 +55,8 @@ func isGen(run string) bool {
 	return s == genPrefix || strings.HasPrefix(s, genPrefix+" ")
 }
 
-// genParts splits "@gen LIST >> TMPL" on the FIRST >>, which is what makes
-// nesting work: the remainder keeps its own >> for the level below.
+// genParts splits on the FIRST >>, which is what makes nesting work: the
+// remainder keeps its own >> for the level below.
 func genParts(run string) (list, tmpl string) {
 	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(run), genPrefix))
 	body = strings.TrimSpace(body)
@@ -63,7 +66,6 @@ func genParts(run string) (list, tmpl string) {
 	return body, "{}"
 }
 
-// substitute fills {} {1}..{9} from line, and {^} from parent.
 func substitute(tmpl, line, parent string) string {
 	out := strings.ReplaceAll(tmpl, "{^}", parent)
 	out = strings.ReplaceAll(out, "{}", line)
@@ -87,7 +89,7 @@ const configTemplate = `# switchboard — your commands, described.
 #   {} whole line, {1}..{9} fields, {^} the line chosen one level up.
 #   if TEMPLATE starts with @gen you descend another level.
 
-ai   | models | pick a model and chat | @gen ollama list \| tail -n +2 >> ollama run {1} | live list, never stale
+ai | models | pick a model and chat | @gen ollama list \| tail -n +2 >> ollama run {1} | live list, never stale
 `
 
 func confDir() string {
@@ -97,7 +99,6 @@ func confDir() string {
 func configPath() string { return filepath.Join(confDir(), "commands.conf") }
 func usagePath() string  { return filepath.Join(confDir(), "usage.json") }
 
-// splitFields splits on unescaped pipes only. "\|" survives as a real pipe.
 func splitFields(line string) []string {
 	var out []string
 	var cur strings.Builder
@@ -127,8 +128,7 @@ func key(c Cmd) string { return c.Group + "/" + c.Name }
 
 func loadUsage() usageMap {
 	u := usageMap{}
-	b, err := os.ReadFile(usagePath())
-	if err == nil {
+	if b, err := os.ReadFile(usagePath()); err == nil {
 		json.Unmarshal(b, &u)
 	}
 	return u
@@ -142,9 +142,9 @@ func (u usageMap) bump(c Cmd) {
 	}
 }
 
-// sortCmds orders by what you actually use. Groups float up by their most-used
-// member; inside a group, most-used first. Ties fall back to alphabetical, so
-// a fresh install still looks sane.
+// sortCmds orders by what you actually use. Groups float up by their
+// most-used member; inside a group, most-used first. Ties are alphabetical
+// so a fresh install still looks sane.
 func sortCmds(cmds []Cmd, u usageMap) {
 	groupMax := map[string]int{}
 	for _, c := range cmds {
@@ -223,17 +223,13 @@ func shellPath() string {
 	return "/bin/sh"
 }
 
-// Two ways to run something, and the difference matters a great deal.
-//
 // interactiveArgs is ONLY safe once the TUI has exited and sb is back in the
 // foreground process group. An interactive zsh does job control: it calls
 // tcsetpgrp and expects to own the terminal. Start one while Bubbletea holds
-// the tty and the kernel sends SIGTTIN — the shell is reading a terminal it
-// does not control — and the whole job suspends. That is the
-// "suspended (tty input)" you saw.
+// the tty and the kernel sends SIGTTIN and the whole job suspends.
 //
 // plainArgs is for anything run *underneath* the TUI. No job control, no
-// .zshrc, no p10k. Aliases will not resolve here, which is the price.
+// .zshrc. Aliases will not resolve there, which is the price.
 func interactiveArgs(cmd string) []string { return []string{"-i", "-c", cmd} }
 func plainArgs(cmd string) []string       { return []string{"-c", cmd} }
 
@@ -248,10 +244,8 @@ func capture(cmdStr string, d time.Duration) ([]byte, error) {
 		c.Stdin = devnull
 	}
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Kill the whole group, not just the shell. `sh -c "sleep 10"` may fork
-	// rather than exec, and the grandchild keeps the stdout pipe open — so
-	// killing the leader alone leaves Output() blocked for the full duration.
-	// The negative pid is the group. WaitDelay caps the pipe wait regardless.
+	// Kill the whole group, not just the shell: a forked grandchild keeps the
+	// stdout pipe open, so killing the leader alone leaves Output() blocked.
 	c.Cancel = func() error {
 		if c.Process == nil {
 			return nil
@@ -289,24 +283,38 @@ const (
 	neonCyan   = "#00f0ff"
 	neonPurple = "#bf00ff"
 	neonPink   = "#ff2f92"
+	inkDark    = "#0a0a0f"
 )
 
 var (
 	cyanRGB   = [3]int{0x00, 0xf0, 0xff}
 	purpleRGB = [3]int{0xbf, 0x00, 0xff}
 
-	cBase   = lipgloss.NewStyle().Foreground(lipgloss.Color("#d8d8e8"))
-	cDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a5a72"))
-	cCool   = lipgloss.NewStyle().Foreground(lipgloss.Color(neonCyan))
-	cWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb020"))
-	cGroup  = lipgloss.NewStyle().Foreground(lipgloss.Color(neonPurple)).Bold(true)
-	cSelTxt = lipgloss.NewStyle().Foreground(lipgloss.Color("#0a0a0f")).
+	cBase = lipgloss.NewStyle().Foreground(lipgloss.Color("#d8d8e8"))
+	cDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a5a72"))
+	cFant = lipgloss.NewStyle().Foreground(lipgloss.Color("#3a3a4c"))
+	cCool = lipgloss.NewStyle().Foreground(lipgloss.Color(neonCyan))
+	cWarn = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb020"))
+	cPurp = lipgloss.NewStyle().Foreground(lipgloss.Color(neonPurple))
+
+	// panes: the focused one gets a cyan border, the other recedes
+	paneOn = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(neonCyan)).Padding(0, 1)
+	paneOff = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#2a2a38")).Padding(0, 1)
+
+	// selection: inverse video when the pane has focus, quiet when it doesn't
+	selOn = lipgloss.NewStyle().Foreground(lipgloss.Color(inkDark)).
 		Background(lipgloss.Color(neonCyan)).Bold(true)
-	cSelDesc = lipgloss.NewStyle().Foreground(lipgloss.Color(neonCyan))
-	cHelp    = lipgloss.NewStyle().Foreground(lipgloss.Color("#4a4a5e"))
-	cCount   = lipgloss.NewStyle().Foreground(lipgloss.Color("#3f3f52"))
-	cBox     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(neonPurple)).Padding(0, 1)
+	selOff = lipgloss.NewStyle().Foreground(lipgloss.Color(neonCyan)).Bold(true)
+
+	// status bar segments, in the style of the lipgloss demo
+	stTag = lipgloss.NewStyle().Foreground(lipgloss.Color(inkDark)).
+		Background(lipgloss.Color(neonPink)).Bold(true).Padding(0, 1)
+	stMid = lipgloss.NewStyle().Foreground(lipgloss.Color("#d8d8e8")).
+		Background(lipgloss.Color("#1c1c28")).Padding(0, 1)
+	stEnd = lipgloss.NewStyle().Foreground(lipgloss.Color(inkDark)).
+		Background(lipgloss.Color(neonPurple)).Bold(true).Padding(0, 1)
 )
 
 func lerp(a, b [3]int, t float64) lipgloss.Color {
@@ -314,7 +322,6 @@ func lerp(a, b [3]int, t float64) lipgloss.Color {
 	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", f(0), f(1), f(2)))
 }
 
-// gradient paints a string cyan → purple, one step per rune.
 func gradient(s string, bold bool) string {
 	r := []rune(s)
 	var b strings.Builder
@@ -332,14 +339,8 @@ func gradient(s string, bold bool) string {
 	return b.String()
 }
 
-// banner is the header. Override it with anything that prints, e.g.
-//
-//	export SB_BANNER='tdfgo -f impossible switchboard'
-//
-// so your TheDraw fonts can drive it. Falls back to a gradient title.
-// customBanner is resolved ONCE, at startup. Resolving it per frame was the
-// other half of the bug: View() runs on every keystroke, so an SB_BANNER of
-// "tdfgo ..." meant a complete interactive-zsh startup per rendered frame.
+// customBanner is resolved ONCE, at startup. Resolving it per frame meant a
+// complete shell startup per rendered keystroke.
 func customBanner() string {
 	c := os.Getenv("SB_BANNER")
 	if c == "" {
@@ -349,25 +350,30 @@ func customBanner() string {
 	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
 		return ""
 	}
-	return strings.TrimRight(string(out), "\n") + "\n"
+	return strings.TrimRight(string(out), "\n")
 }
 
-func banner(width int, custom string) string {
-	if custom != "" {
-		return custom
+// paneTitle is a heading plus an underline rule, drawn inside the pane.
+func paneTitle(s string, w int, focused bool) string {
+	t := strings.ToUpper(s)
+	if len(t) > w {
+		t = t[:w]
 	}
-	w := width - 2
-	if w < 20 {
-		w = 20
+	style := cDim
+	if focused {
+		style = cCool.Bold(true)
 	}
-	if w > 76 {
-		w = 76
+	rule := strings.Repeat("─", maxi(0, w))
+	return style.Render(t) + "\n" + cFant.Render(rule)
+}
+
+// pad forces a string to exactly n visible columns.
+func pad(s string, n int) string {
+	w := lipgloss.Width(s)
+	if w > n {
+		return truncate(s, n)
 	}
-	rule := strings.Repeat("▀▄", w/2)
-	return " " + gradient(rule, false) + "\n" +
-		" " + gradient("▌ S W I T C H B O A R D", true) + "  " +
-		cDim.Render("the things you forget you have") + "\n" +
-		" " + gradient(rule, false) + "\n"
+	return s + strings.Repeat(" ", n-w)
 }
 
 // ---------------------------------------------------------------- model
@@ -376,12 +382,19 @@ type mode int
 
 const (
 	modeList mode = iota
+	modeFilter
 	modeAdd
 	modeConfirmDelete
 	modeGen
 )
 
-// a level of the generator stack
+type focus int
+
+const (
+	focusGroups focus = iota
+	focusItems
+)
+
 type genLevel struct {
 	title  string
 	tmpl   string // raw, not yet substituted
@@ -391,24 +404,31 @@ type genLevel struct {
 	cursor int
 }
 
-type model struct {
-	cmds     []Cmd
-	usage    usageMap
-	filtered []int
-	cursor   int
-	filter   textinput.Model
-	mode     mode
-	addField int
-	addBuf   [5]textinput.Model
-	status   string
-	quitting bool
-	chosen   *Cmd
-	h, w     int
+const allGroups = "all"
 
+type model struct {
+	cmds  []Cmd
+	usage usageMap
+
+	groups     []string // "all" first, then real groups in usage order
+	groupIdx   int
+	items      []int // indices into cmds, for the current group + filter
+	itemIdx    int
+	focus      focus
+	filterText string
+
+	mode      mode
+	filter    textinput.Model
+	addField  int
+	addBuf    [5]textinput.Model
+	status    string
+	quitting  bool
+	chosen    *Cmd
+	h, w      int
 	bannerTxt string
-	stack     []genLevel
-	genFilter textinput.Model
-	genLoad   bool
+
+	stack   []genLevel
+	genLoad bool
 }
 
 func newInput(placeholder, prompt string, limit int) textinput.Model {
@@ -423,20 +443,64 @@ func newInput(placeholder, prompt string, limit int) textinput.Model {
 func initialModel() model {
 	u := loadUsage()
 	cmds, err := loadCommands(u)
-	m := model{cmds: cmds, usage: u, bannerTxt: customBanner()}
+	m := model{cmds: cmds, usage: u, bannerTxt: customBanner(), w: 80, h: 24}
 	if err != nil {
 		m.status = "could not read config: " + err.Error()
 	}
-	m.filter = newInput("type to filter", "  ▸ ", 40)
-	m.filter.Focus()
-	m.genFilter = newInput("type to filter", "  ▸ ", 40)
+	m.filter = newInput("filter", "  / ", 40)
 
 	labels := []string{"group", "name", "description", "command", "note (optional)"}
 	for i := range m.addBuf {
 		m.addBuf[i] = newInput(labels[i], fmt.Sprintf("  %-16s ", labels[i]+":"), 200)
 	}
-	m.refilter()
+	m.rebuildGroups()
+	m.rebuildItems()
 	return m
+}
+
+func (m *model) rebuildGroups() {
+	seen := map[string]bool{}
+	m.groups = []string{allGroups}
+	for _, c := range m.cmds { // cmds are already in usage order
+		if !seen[c.Group] {
+			seen[c.Group] = true
+			m.groups = append(m.groups, c.Group)
+		}
+	}
+	if m.groupIdx >= len(m.groups) {
+		m.groupIdx = 0
+	}
+}
+
+func (m *model) matches(c Cmd) bool {
+	q := strings.ToLower(m.filterText)
+	if q == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(c.Name), q) ||
+		strings.Contains(strings.ToLower(c.Desc), q) ||
+		strings.Contains(strings.ToLower(c.Group), q) ||
+		strings.Contains(strings.ToLower(c.Note), q)
+}
+
+func (m *model) rebuildItems() {
+	g := m.groups[m.groupIdx]
+	m.items = m.items[:0]
+	for i, c := range m.cmds {
+		if (g == allGroups || c.Group == g) && m.matches(c) {
+			m.items = append(m.items, i)
+		}
+	}
+	if m.itemIdx >= len(m.items) {
+		m.itemIdx = maxi(0, len(m.items)-1)
+	}
+}
+
+func (m *model) current() (Cmd, bool) {
+	if len(m.items) == 0 {
+		return Cmd{}, false
+	}
+	return m.cmds[m.items[m.itemIdx]], true
 }
 
 func (m *model) top() *genLevel {
@@ -446,29 +510,12 @@ func (m *model) top() *genLevel {
 	return &m.stack[len(m.stack)-1]
 }
 
-func (m *model) refilter() {
-	q := strings.ToLower(m.filter.Value())
-	m.filtered = m.filtered[:0]
-	for i, c := range m.cmds {
-		if q == "" ||
-			strings.Contains(strings.ToLower(c.Name), q) ||
-			strings.Contains(strings.ToLower(c.Desc), q) ||
-			strings.Contains(strings.ToLower(c.Group), q) ||
-			strings.Contains(strings.ToLower(c.Note), q) {
-			m.filtered = append(m.filtered, i)
-		}
-	}
-	if m.cursor >= len(m.filtered) {
-		m.cursor = maxi(0, len(m.filtered)-1)
-	}
-}
-
 func (m *model) regenFilter() {
 	lv := m.top()
 	if lv == nil {
 		return
 	}
-	q := strings.ToLower(m.genFilter.Value())
+	q := strings.ToLower(m.filterText)
 	lv.shown = lv.shown[:0]
 	for i, s := range lv.items {
 		if q == "" || strings.Contains(strings.ToLower(s), q) {
@@ -480,14 +527,12 @@ func (m *model) regenFilter() {
 	}
 }
 
-// push opens a new generator level.
 func (m *model) push(title, listCmd, tmpl, parent string) tea.Cmd {
 	m.stack = append(m.stack, genLevel{title: title, tmpl: tmpl, parent: parent})
 	m.genLoad = true
 	m.mode = modeGen
-	m.filter.Blur()
-	m.genFilter.SetValue("")
-	m.genFilter.Focus()
+	m.filterText = ""
+	m.filter.SetValue("")
 	m.status = ""
 	return runGenerator(listCmd)
 }
@@ -496,11 +541,11 @@ func (m *model) pop() {
 	if len(m.stack) > 0 {
 		m.stack = m.stack[:len(m.stack)-1]
 	}
-	m.genFilter.SetValue("")
+	m.filterText = ""
+	m.filter.SetValue("")
 	if len(m.stack) == 0 {
 		m.mode = modeList
-		m.genFilter.Blur()
-		m.filter.Focus()
+		m.rebuildItems()
 	} else {
 		m.regenFilter()
 	}
@@ -508,6 +553,12 @@ func (m *model) pop() {
 
 func maxi(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+func mini(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b
@@ -548,172 +599,293 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch m.mode {
-
-		case modeGen:
-			lv := m.top()
-			switch msg.String() {
-			case "esc", "ctrl+c", "left":
-				m.pop()
-				return m, nil
-			case "up", "ctrl+p":
-				if lv != nil && lv.cursor > 0 {
-					lv.cursor--
-				}
-				return m, nil
-			case "down", "ctrl+n":
-				if lv != nil && lv.cursor < len(lv.shown)-1 {
-					lv.cursor++
-				}
-				return m, nil
-			case "enter", "right":
-				if lv == nil || len(lv.shown) == 0 {
-					return m, nil
-				}
-				line := lv.items[lv.shown[lv.cursor]]
-				// A template that is itself a generator descends a level.
-				if isGen(lv.tmpl) {
-					inList, inTmpl := genParts(lv.tmpl)
-					return m, m.push(line,
-						substitute(inList, line, lv.parent), inTmpl, line)
-				}
-				if msg.String() == "right" {
-					return m, nil
-				}
-				c := Cmd{Name: lv.title, Run: substitute(lv.tmpl, line, lv.parent)}
-				m.chosen = &c
-				m.quitting = true
-				return m, tea.Quit
-			}
-			var cmd tea.Cmd
-			m.genFilter, cmd = m.genFilter.Update(msg)
-			m.regenFilter()
-			return m, cmd
-
+		case modeFilter:
+			return m.updateFilter(msg)
 		case modeAdd:
-			switch msg.String() {
-			case "esc":
-				m.mode = modeList
-				m.status = ""
-				return m, nil
-			case "tab", "down":
-				m.addBuf[m.addField].Blur()
-				m.addField = (m.addField + 1) % len(m.addBuf)
-				m.addBuf[m.addField].Focus()
-				return m, nil
-			case "shift+tab", "up":
-				m.addBuf[m.addField].Blur()
-				m.addField = (m.addField - 1 + len(m.addBuf)) % len(m.addBuf)
-				m.addBuf[m.addField].Focus()
-				return m, nil
-			case "enter":
-				g := strings.TrimSpace(m.addBuf[0].Value())
-				n := strings.TrimSpace(m.addBuf[1].Value())
-				r := strings.TrimSpace(m.addBuf[3].Value())
-				if g == "" || n == "" || r == "" {
-					m.status = "group, name and command are required"
-					return m, nil
-				}
-				m.cmds = append(m.cmds, Cmd{
-					Group: g, Name: n,
-					Desc: strings.TrimSpace(m.addBuf[2].Value()),
-					Run:  r,
-					Note: strings.TrimSpace(m.addBuf[4].Value()),
-				})
-				sortCmds(m.cmds, m.usage)
-				if err := saveCommands(m.cmds); err != nil {
-					m.status = "save failed: " + err.Error()
-				} else {
-					m.status = "added " + n
-				}
-				for i := range m.addBuf {
-					m.addBuf[i].SetValue("")
-					m.addBuf[i].Blur()
-				}
-				m.addField = 0
-				m.mode = modeList
-				m.refilter()
-				return m, nil
-			}
-			var cmd tea.Cmd
-			m.addBuf[m.addField], cmd = m.addBuf[m.addField].Update(msg)
-			return m, cmd
-
+			return m.updateAdd(msg)
 		case modeConfirmDelete:
-			switch msg.String() {
-			case "y", "Y":
-				if len(m.filtered) > 0 {
-					idx := m.filtered[m.cursor]
-					name := m.cmds[idx].Name
-					m.cmds = append(m.cmds[:idx], m.cmds[idx+1:]...)
-					if err := saveCommands(m.cmds); err != nil {
-						m.status = "save failed: " + err.Error()
-					} else {
-						m.status = "deleted " + name
-					}
-					m.refilter()
-				}
-				m.mode = modeList
-				return m, nil
-			default:
-				m.mode = modeList
-				m.status = ""
-				return m, nil
-			}
-
-		default: // modeList
-			switch msg.String() {
-			case "ctrl+c", "esc":
-				m.quitting = true
-				return m, tea.Quit
-			case "up", "ctrl+p":
-				if m.cursor > 0 {
-					m.cursor--
-				}
-				return m, nil
-			case "down", "ctrl+n":
-				if m.cursor < len(m.filtered)-1 {
-					m.cursor++
-				}
-				return m, nil
-			case "enter", "right":
-				if len(m.filtered) == 0 {
-					return m, nil
-				}
-				c := m.cmds[m.filtered[m.cursor]]
-				if isGen(c.Run) {
-					list, tmpl := genParts(c.Run)
-					m.usage.bump(c)
-					return m, m.push(c.Name, list, tmpl, "")
-				}
-				if msg.String() == "right" {
-					return m, nil
-				}
-				m.chosen = &c
-				m.quitting = true
-				return m, tea.Quit
-			case "ctrl+a":
-				m.mode = modeAdd
-				m.addField = 0
-				m.addBuf[0].Focus()
-				m.status = ""
-				return m, nil
-			case "ctrl+d":
-				if len(m.filtered) > 0 {
-					m.mode = modeConfirmDelete
-				}
-				return m, nil
-			case "ctrl+e":
-				m.chosen = &Cmd{Name: "__edit__",
-					Run: "${EDITOR:-nano} " + configPath()}
-				m.quitting = true
-				return m, tea.Quit
-			}
-			var cmd tea.Cmd
-			m.filter, cmd = m.filter.Update(msg)
-			m.refilter()
-			return m, cmd
+			return m.updateConfirm(msg)
+		case modeGen:
+			return m.updateGen(msg)
+		default:
+			return m.updateList(msg)
 		}
 	}
+	return m, nil
+}
+
+// filter mode is explicit, which is what frees j/k/h/l for navigation.
+func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.filterText = ""
+		m.filter.SetValue("")
+		m.filter.Blur()
+		m.mode = modeList
+		if len(m.stack) > 0 {
+			m.mode = modeGen
+			m.regenFilter()
+		} else {
+			m.rebuildItems()
+		}
+		return m, nil
+	case "enter":
+		m.filter.Blur()
+		m.mode = modeList
+		if len(m.stack) > 0 {
+			m.mode = modeGen
+		} else {
+			m.focus = focusItems
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.filter, cmd = m.filter.Update(msg)
+	m.filterText = m.filter.Value()
+	if len(m.stack) > 0 {
+		m.regenFilter()
+	} else {
+		m.rebuildItems()
+	}
+	return m, cmd
+}
+
+func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "esc":
+		m.quitting = true
+		return m, tea.Quit
+
+	case "/":
+		m.mode = modeFilter
+		m.filter.Focus()
+		m.status = ""
+		return m, textinput.Blink
+
+	case "tab":
+		m.focus = 1 - m.focus
+		return m, nil
+
+	case "h", "left":
+		m.focus = focusGroups
+		return m, nil
+
+	case "l", "right":
+		if m.focus == focusGroups {
+			m.focus = focusItems
+			return m, nil
+		}
+		if c, ok := m.current(); ok && isGen(c.Run) {
+			list, tmpl := genParts(c.Run)
+			m.usage.bump(c)
+			return m, m.push(c.Name, list, tmpl, "")
+		}
+		return m, nil
+
+	case "k", "up":
+		if m.focus == focusGroups {
+			if m.groupIdx > 0 {
+				m.groupIdx--
+				m.itemIdx = 0
+				m.rebuildItems()
+			}
+		} else if m.itemIdx > 0 {
+			m.itemIdx--
+		}
+		return m, nil
+
+	case "j", "down":
+		if m.focus == focusGroups {
+			if m.groupIdx < len(m.groups)-1 {
+				m.groupIdx++
+				m.itemIdx = 0
+				m.rebuildItems()
+			}
+		} else if m.itemIdx < len(m.items)-1 {
+			m.itemIdx++
+		}
+		return m, nil
+
+	case "g", "home":
+		if m.focus == focusGroups {
+			m.groupIdx, m.itemIdx = 0, 0
+			m.rebuildItems()
+		} else {
+			m.itemIdx = 0
+		}
+		return m, nil
+
+	case "G", "end":
+		if m.focus == focusGroups {
+			m.groupIdx = len(m.groups) - 1
+			m.itemIdx = 0
+			m.rebuildItems()
+		} else {
+			m.itemIdx = maxi(0, len(m.items)-1)
+		}
+		return m, nil
+
+	case "enter":
+		if m.focus == focusGroups {
+			m.focus = focusItems
+			return m, nil
+		}
+		c, ok := m.current()
+		if !ok {
+			return m, nil
+		}
+		if isGen(c.Run) {
+			list, tmpl := genParts(c.Run)
+			m.usage.bump(c)
+			return m, m.push(c.Name, list, tmpl, "")
+		}
+		m.chosen = &c
+		m.quitting = true
+		return m, tea.Quit
+
+	case "a":
+		m.mode = modeAdd
+		m.addField = 0
+		m.addBuf[0].Focus()
+		m.status = ""
+		return m, textinput.Blink
+
+	case "d":
+		if _, ok := m.current(); ok {
+			m.mode = modeConfirmDelete
+		}
+		return m, nil
+
+	case "e":
+		m.chosen = &Cmd{Name: "__edit__", Run: "${EDITOR:-nano} " + configPath()}
+		m.quitting = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	lv := m.top()
+	switch msg.String() {
+	case "esc", "ctrl+c", "h", "left", "q":
+		m.pop()
+		return m, nil
+	case "/":
+		m.mode = modeFilter
+		m.filter.Focus()
+		return m, textinput.Blink
+	case "k", "up":
+		if lv != nil && lv.cursor > 0 {
+			lv.cursor--
+		}
+		return m, nil
+	case "j", "down":
+		if lv != nil && lv.cursor < len(lv.shown)-1 {
+			lv.cursor++
+		}
+		return m, nil
+	case "g", "home":
+		if lv != nil {
+			lv.cursor = 0
+		}
+		return m, nil
+	case "G", "end":
+		if lv != nil {
+			lv.cursor = maxi(0, len(lv.shown)-1)
+		}
+		return m, nil
+	case "enter", "l", "right":
+		if lv == nil || len(lv.shown) == 0 {
+			return m, nil
+		}
+		line := lv.items[lv.shown[lv.cursor]]
+		if isGen(lv.tmpl) { // a template that is itself a generator descends
+			inList, inTmpl := genParts(lv.tmpl)
+			return m, m.push(line, substitute(inList, line, lv.parent), inTmpl, line)
+		}
+		if msg.String() != "enter" {
+			return m, nil
+		}
+		c := Cmd{Name: lv.title, Run: substitute(lv.tmpl, line, lv.parent)}
+		m.chosen = &c
+		m.quitting = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m model) updateAdd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		for i := range m.addBuf {
+			m.addBuf[i].Blur()
+		}
+		m.mode = modeList
+		m.status = ""
+		return m, nil
+	case "tab", "down":
+		m.addBuf[m.addField].Blur()
+		m.addField = (m.addField + 1) % len(m.addBuf)
+		m.addBuf[m.addField].Focus()
+		return m, nil
+	case "shift+tab", "up":
+		m.addBuf[m.addField].Blur()
+		m.addField = (m.addField - 1 + len(m.addBuf)) % len(m.addBuf)
+		m.addBuf[m.addField].Focus()
+		return m, nil
+	case "enter":
+		g := strings.TrimSpace(m.addBuf[0].Value())
+		n := strings.TrimSpace(m.addBuf[1].Value())
+		r := strings.TrimSpace(m.addBuf[3].Value())
+		if g == "" || n == "" || r == "" {
+			m.status = "group, name and command are required"
+			return m, nil
+		}
+		m.cmds = append(m.cmds, Cmd{
+			Group: g, Name: n,
+			Desc: strings.TrimSpace(m.addBuf[2].Value()),
+			Run:  r,
+			Note: strings.TrimSpace(m.addBuf[4].Value()),
+		})
+		sortCmds(m.cmds, m.usage)
+		if err := saveCommands(m.cmds); err != nil {
+			m.status = "save failed: " + err.Error()
+		} else {
+			m.status = "added " + n
+		}
+		for i := range m.addBuf {
+			m.addBuf[i].SetValue("")
+			m.addBuf[i].Blur()
+		}
+		m.addField = 0
+		m.mode = modeList
+		m.rebuildGroups()
+		m.rebuildItems()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.addBuf[m.addField], cmd = m.addBuf[m.addField].Update(msg)
+	return m, cmd
+}
+
+func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if s := msg.String(); s == "y" || s == "Y" {
+		if len(m.items) > 0 {
+			idx := m.items[m.itemIdx]
+			name := m.cmds[idx].Name
+			m.cmds = append(m.cmds[:idx], m.cmds[idx+1:]...)
+			if err := saveCommands(m.cmds); err != nil {
+				m.status = "save failed: " + err.Error()
+			} else {
+				m.status = "deleted " + name
+			}
+			m.rebuildGroups()
+			m.rebuildItems()
+		}
+	} else {
+		m.status = ""
+	}
+	m.mode = modeList
 	return m, nil
 }
 
@@ -735,153 +907,269 @@ func (m model) View() string {
 		return m.viewAdd()
 	case modeConfirmDelete:
 		return m.viewConfirm()
-	case modeGen:
-		return m.viewGen()
 	}
-	return m.viewList()
+	return m.viewMain()
 }
 
-func (m model) window(cursor int) (start, visible int) {
-	visible = m.h - 14
-	if visible < 6 {
-		visible = 6
+// geometry derives every dimension from the terminal size, so nothing is
+// hardcoded and the layout degrades instead of breaking.
+func (m model) geometry() (railW, itemW, rows int) {
+	w := m.w
+	if w < 40 {
+		w = 40
 	}
+	railW = 14
+	if w < 64 {
+		railW = 10
+	}
+	// each pane costs 2 border + 2 padding columns
+	itemW = w - railW - 4 - 4 - 1
+	if itemW < 20 {
+		itemW = 20
+	}
+	bannerH := 1
+	if m.bannerTxt != "" {
+		bannerH = strings.Count(m.bannerTxt, "\n") + 1
+	}
+	rows = m.h - bannerH - 8 // panes + detail(3) + status(1) + margins
+	if rows < 3 {
+		rows = 3
+	}
+	return railW, itemW, rows
+}
+
+func window(cursor, n, visible int) (start, end int) {
 	if cursor >= visible {
 		start = cursor - visible + 1
 	}
-	return start, visible
+	end = mini(n, start+visible)
+	return start, end
 }
 
-func (m model) width() int {
-	if m.w <= 0 {
-		return 80
+func (m model) viewMain() string {
+	railW, itemW, rows := m.geometry()
+	inGen := m.mode == modeGen || (m.mode == modeFilter && len(m.stack) > 0)
+
+	var head string
+	if m.bannerTxt != "" {
+		head = m.bannerTxt
+	} else {
+		head = " " + gradient("▌ S W I T C H B O A R D", true) + "  " +
+			cDim.Render("the things you forget you have")
 	}
-	return m.w
+
+	rail := paneOff
+	items := paneOn
+	if !inGen && m.focus == focusGroups {
+		rail, items = paneOn, paneOff
+	}
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top,
+		rail.Height(rows).Render(m.renderRail(railW, rows, inGen)),
+		items.Height(rows).Render(m.renderItems(itemW, rows, inGen)),
+	)
+
+	totalW := railW + itemW + 8
+	out := head + "\n" + body + "\n" + m.renderDetail(totalW)
+	if m.mode == modeFilter {
+		out += "\n" + m.filter.View()
+	} else {
+		out += "\n" + m.renderStatus(totalW, inGen)
+	}
+	return out
 }
 
-func (m model) viewList() string {
+// renderRail is the left column: groups normally, the generator path when
+// you have descended into one.
+func (m model) renderRail(w, rows int, inGen bool) string {
 	var b strings.Builder
-	b.WriteString("\n" + banner(m.width(), m.bannerTxt) + "\n")
-	b.WriteString(m.filter.View() + "\n\n")
-
-	if len(m.filtered) == 0 {
-		b.WriteString(cDim.Render("  nothing matches\n"))
+	if inGen {
+		b.WriteString(paneTitle("path", w, false) + "\n")
+		b.WriteString(cDim.Render(pad("sb", w)) + "\n")
+		for i, lv := range m.stack {
+			marker := "  "
+			if i == len(m.stack)-1 {
+				marker = cPurp.Render("▸ ")
+			}
+			b.WriteString(marker + cBase.Render(truncate(lv.title, w-2)) + "\n")
+		}
+		return b.String()
 	}
 
-	lastGroup := ""
-	start, visible := m.window(m.cursor)
+	focused := m.focus == focusGroups
+	b.WriteString(paneTitle("groups", w, focused) + "\n")
+	start, end := window(m.groupIdx, len(m.groups), rows-2)
+	for i := start; i < end; i++ {
+		g := m.groups[i]
+		label := g
+		if g == allGroups {
+			label = "★ all"
+		}
+		line := pad(truncate(label, w), w)
+		switch {
+		case i == m.groupIdx && focused:
+			b.WriteString(selOn.Render(line))
+		case i == m.groupIdx:
+			b.WriteString(selOff.Render(line))
+		default:
+			b.WriteString(cDim.Render(line))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
 
-	for vi, idx := range m.filtered {
-		if vi < start || vi >= start+visible {
-			continue
+func (m model) renderItems(w, rows int, inGen bool) string {
+	var b strings.Builder
+
+	if inGen {
+		lv := m.top()
+		title := "…"
+		if lv != nil {
+			title = lv.title
 		}
-		c := m.cmds[idx]
-		if c.Group != lastGroup {
-			b.WriteString("  " + cGroup.Render("▌ "+strings.ToUpper(c.Group)) + "\n")
-			lastGroup = c.Group
+		b.WriteString(paneTitle(title, w, true) + "\n")
+		if m.genLoad {
+			b.WriteString(cDim.Render("running…"))
+			return b.String()
 		}
-		mark := " "
-		if isGen(c.Run) {
-			mark = cGroup.Render("›")
+		if lv == nil || len(lv.shown) == 0 {
+			b.WriteString(cDim.Render("nothing matches"))
+			return b.String()
 		}
+		nested := isGen(lv.tmpl)
+		start, end := window(lv.cursor, len(lv.shown), rows-2)
+		for i := start; i < end; i++ {
+			line := lv.items[lv.shown[i]]
+			mark := " "
+			if nested {
+				mark = "›"
+			}
+			text := pad(truncate(line, w-2), w-2) + " "
+			if i == lv.cursor {
+				b.WriteString(selOn.Render(" "+text) + cPurp.Render(mark))
+			} else {
+				b.WriteString(" " + cBase.Render(text) + cFant.Render(mark))
+			}
+			b.WriteString("\n")
+		}
+		return b.String()
+	}
+
+	focused := m.focus == focusItems
+	b.WriteString(paneTitle(m.groups[m.groupIdx], w, focused) + "\n")
+	if len(m.items) == 0 {
+		b.WriteString(cDim.Render("nothing matches"))
+		return b.String()
+	}
+
+	// name column sized to the longest name on screen, so descriptions line up
+	nameW := 8
+	for _, idx := range m.items {
+		if n := lipgloss.Width(m.cmds[idx].Name); n > nameW {
+			nameW = n
+		}
+	}
+	nameW = mini(nameW, 16)
+
+	start, end := window(m.itemIdx, len(m.items), rows-2)
+	for i := start; i < end; i++ {
+		c := m.cmds[m.items[i]]
 		hits := ""
 		if n := m.usage[key(c)]; n > 0 {
-			hits = cCount.Render(fmt.Sprintf(" ×%d", n))
+			hits = fmt.Sprintf(" ×%d", n)
 		}
-		if vi == m.cursor {
-			b.WriteString(" " + cSelTxt.Render(fmt.Sprintf(" ▶ %-13s", c.Name)) +
-				" " + cSelDesc.Render(c.Desc) + hits + " " + mark + "\n")
-		} else {
-			b.WriteString("   " + cCool.Render(fmt.Sprintf("%-13s", c.Name)) +
-				" " + cDim.Render(c.Desc) + hits + " " + mark + "\n")
-		}
-	}
-
-	if len(m.filtered) > 0 {
-		c := m.cmds[m.filtered[m.cursor]]
-		var detail string
+		mark := " "
 		if isGen(c.Run) {
-			list, tmpl := genParts(c.Run)
-			detail = cGroup.Render("list ") + cBase.Render(truncate(list, m.width()-12)) + "\n" +
-				cGroup.Render("run  ") + cBase.Render(truncate(tmpl, m.width()-12))
-		} else {
-			detail = cCool.Render("$ ") + cBase.Render(truncate(c.Run, m.width()-10))
+			mark = "›"
 		}
-		if c.Note != "" {
-			detail += "\n" + cWarn.Render(truncate(c.Note, m.width()-10))
-		}
-		b.WriteString("\n" + cBox.Render(detail) + "\n")
-	}
+		name := pad(truncate(c.Name, nameW), nameW)
+		descW := w - nameW - lipgloss.Width(hits) - 4
+		desc := pad(truncate(c.Desc, maxi(1, descW)), maxi(1, descW))
 
-	if m.status != "" {
-		b.WriteString("  " + cWarn.Render(m.status) + "\n")
+		switch {
+		case i == m.itemIdx && focused:
+			b.WriteString(selOn.Render(" "+name+" "+desc+hits+" ") + cPurp.Render(mark))
+		case i == m.itemIdx:
+			b.WriteString(" " + selOff.Render(name) + " " + cBase.Render(desc) +
+				cFant.Render(hits) + " " + cPurp.Render(mark))
+		default:
+			b.WriteString(" " + cCool.Render(name) + " " + cDim.Render(desc) +
+				cFant.Render(hits) + " " + cFant.Render(mark))
+		}
+		b.WriteString("\n")
 	}
-	b.WriteString(cHelp.Render(
-		"  ↵ run   → open a ›list   ^a add   ^d delete   ^e edit file   esc quit") + "\n")
 	return b.String()
 }
 
-func (m model) viewGen() string {
-	var b strings.Builder
-	var crumbs []string
-	for _, lv := range m.stack {
-		crumbs = append(crumbs, lv.title)
-	}
-	b.WriteString("\n " + gradient("▌ "+strings.ToUpper(strings.Join(crumbs, " / ")), true) + "\n\n")
+// renderDetail is the pane underneath: exactly what will run, and the note.
+func (m model) renderDetail(w int) string {
+	inner := w - 4
+	var lines []string
 
-	if m.genLoad {
-		b.WriteString(cDim.Render("  running…\n"))
-		b.WriteString("\n" + cHelp.Render("  esc back") + "\n")
-		return b.String()
-	}
-
-	lv := m.top()
-	if lv == nil {
-		return b.String()
-	}
-
-	b.WriteString(m.genFilter.View() + "\n\n")
-	if len(lv.shown) == 0 {
-		b.WriteString(cDim.Render("  nothing matches\n"))
-	}
-
-	nested := isGen(lv.tmpl)
-	start, visible := m.window(lv.cursor)
-	for vi, idx := range lv.shown {
-		if vi < start || vi >= start+visible {
-			continue
-		}
-		line := truncate(lv.items[idx], m.width()-10)
-		mark := " "
-		if nested {
-			mark = cGroup.Render("›")
-		}
-		if vi == lv.cursor {
-			b.WriteString(" " + cSelTxt.Render(" ▶ "+line+" ") + " " + mark + "\n")
+	if m.mode == modeGen || (m.mode == modeFilter && len(m.stack) > 0) {
+		lv := m.top()
+		if lv == nil || len(lv.shown) == 0 {
+			lines = append(lines, cDim.Render("—"))
 		} else {
-			b.WriteString("   " + cBase.Render(line) + " " + mark + "\n")
+			line := lv.items[lv.shown[lv.cursor]]
+			if isGen(lv.tmpl) {
+				inList, _ := genParts(lv.tmpl)
+				lines = append(lines, cPurp.Render("list ")+
+					cBase.Render(truncate(substitute(inList, line, lv.parent), inner-6)))
+			} else {
+				lines = append(lines, cCool.Render("$ ")+
+					cBase.Render(truncate(substitute(lv.tmpl, line, lv.parent), inner-3)))
+			}
 		}
+	} else if c, ok := m.current(); ok {
+		if isGen(c.Run) {
+			list, tmpl := genParts(c.Run)
+			lines = append(lines,
+				cPurp.Render("list ")+cBase.Render(truncate(list, inner-6)),
+				cPurp.Render("run  ")+cBase.Render(truncate(tmpl, inner-6)))
+		} else {
+			lines = append(lines, cCool.Render("$ ")+cBase.Render(truncate(c.Run, inner-3)))
+		}
+		if c.Note != "" {
+			lines = append(lines, cWarn.Render(truncate(c.Note, inner)))
+		}
+	} else {
+		lines = append(lines, cDim.Render("—"))
+	}
+	if m.status != "" {
+		lines = append(lines, cWarn.Render(truncate(m.status, inner)))
+	}
+	return paneOff.Width(w - 2).Render(strings.Join(lines, "\n"))
+}
+
+// renderStatus is the bar along the bottom, segmented like the lipgloss demo.
+func (m model) renderStatus(w int, inGen bool) string {
+	tag := "SB"
+	keys := "↵ run  tab pane  / filter  a add  d del  e edit  q quit"
+	if inGen {
+		tag = "LIST"
+		keys = "↵ run  h back  / filter  q back"
+	}
+	mid := "—"
+	if inGen {
+		var crumbs []string
+		for _, lv := range m.stack {
+			crumbs = append(crumbs, lv.title)
+		}
+		mid = strings.Join(crumbs, " / ")
+	} else if c, ok := m.current(); ok {
+		mid = c.Group + "/" + c.Name
 	}
 
-	if len(lv.shown) > 0 {
-		line := lv.items[lv.shown[lv.cursor]]
-		var detail string
-		if nested {
-			inList, _ := genParts(lv.tmpl)
-			detail = cGroup.Render("list ") +
-				cBase.Render(truncate(substitute(inList, line, lv.parent), m.width()-12))
-		} else {
-			detail = cCool.Render("$ ") +
-				cBase.Render(truncate(substitute(lv.tmpl, line, lv.parent), m.width()-12))
-		}
-		b.WriteString("\n" + cBox.Render(detail) + "\n")
+	left := stTag.Render(tag)
+	right := stEnd.Render(filepath.Base(shellPath()))
+	fill := w - lipgloss.Width(left) - lipgloss.Width(right)
+	if fill < 4 {
+		fill = 4
 	}
-	hint := "  ↵ run   esc back"
-	if nested {
-		hint = "  ↵ open   esc back"
-	}
-	b.WriteString(cHelp.Render(hint) + "\n")
-	return b.String()
+	body := truncate(mid+"   "+cDim.Render(keys), fill-2)
+	return left + stMid.Width(fill).Render(body) + right
 }
 
 func (m model) viewAdd() string {
@@ -893,25 +1181,28 @@ func (m model) viewAdd() string {
 	if m.status != "" {
 		b.WriteString("\n  " + cWarn.Render(m.status) + "\n")
 	}
-	b.WriteString("\n" + cHelp.Render("  tab next field   ↵ save   esc cancel") + "\n")
+	b.WriteString("\n" + cDim.Render("  tab next field   ↵ save   esc cancel") + "\n")
 	return b.String()
 }
 
 func (m model) viewConfirm() string {
-	c := m.cmds[m.filtered[m.cursor]]
+	c, _ := m.current()
 	return "\n " + gradient("▌ DELETE", true) + "\n\n  " +
 		cBase.Render("remove ") + cCool.Render(c.Name) + cBase.Render("?") +
-		"\n\n" + cHelp.Render("  y yes   any other key no") + "\n"
+		"\n\n" + cDim.Render("  y yes   any other key no") + "\n"
 }
 
 // truncate by runes, not bytes — otherwise multibyte text gets cut mid-character
 func truncate(s string, n int) string {
-	if n < 10 {
-		n = 10
+	if n < 1 {
+		n = 1
 	}
 	r := []rune(s)
 	if len(r) <= n {
 		return s
+	}
+	if n == 1 {
+		return "…"
 	}
 	return string(r[:n-1]) + "…"
 }
@@ -919,7 +1210,7 @@ func truncate(s string, n int) string {
 // ---------------------------------------------------------------- main
 
 func main() {
-	p := tea.NewProgram(initialModel())
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	final, err := p.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "switchboard:", err)
