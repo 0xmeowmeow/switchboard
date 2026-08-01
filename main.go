@@ -66,6 +66,22 @@ func genParts(run string) (list, tmpl string) {
 	return body, "{}"
 }
 
+// An "@exec" command runs WITHOUT quitting sb. Bubbletea hands the terminal
+// to the child, waits, then takes it back — so you land in the example, poke
+// at it, quit it, and you are back in the menu. Everything else still quits
+// sb and hands off, which is what you want for a GUI or a shell you intend
+// to stay in.
+const execPrefix = "@exec"
+
+func isExec(run string) bool {
+	s := strings.TrimSpace(run)
+	return strings.HasPrefix(s, execPrefix+" ")
+}
+
+func execBody(run string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(run), execPrefix))
+}
+
 func substitute(tmpl, line, parent string) string {
 	out := strings.ReplaceAll(tmpl, "{^}", parent)
 	out = strings.ReplaceAll(out, "{}", line)
@@ -254,6 +270,24 @@ func capture(cmdStr string, d time.Duration) ([]byte, error) {
 	}
 	c.WaitDelay = 2 * time.Second
 	return c.Output()
+}
+
+type execDoneMsg struct {
+	label string
+	err   error
+}
+
+// runExec releases the terminal, runs the command, and restores the TUI.
+// The shell is interactive here for the same reason it is at hand-off time:
+// bubbletea has genuinely given the terminal back, sb is still the foreground
+// process group, so zsh's job control initialises cleanly and your aliases
+// and functions resolve.
+func runExec(label, cmdStr string) tea.Cmd {
+	c := exec.Command(shellPath(), interactiveArgs(cmdStr)...)
+	c.Env = append(os.Environ(), "SB_CHILD=1")
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return execDoneMsg{label: label, err: err}
+	})
 }
 
 type genResultMsg struct {
@@ -575,6 +609,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.w, m.h = msg.Width, msg.Height
 		return m, nil
 
+	case execDoneMsg:
+		if msg.err != nil {
+			m.status = msg.label + ": " + msg.err.Error()
+		} else {
+			m.status = "ran " + msg.label
+		}
+		return m, nil
+
 	case genResultMsg:
 		m.genLoad = false
 		lv := m.top()
@@ -739,6 +781,10 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.usage.bump(c)
 			return m, m.push(c.Name, list, tmpl, "")
 		}
+		m.usage.bump(c)
+		if isExec(c.Run) {
+			return m, runExec(c.Name, execBody(c.Run))
+		}
 		m.chosen = &c
 		m.quitting = true
 		return m, tea.Quit
@@ -806,7 +852,11 @@ func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() != "enter" {
 			return m, nil
 		}
-		c := Cmd{Name: lv.title, Run: substitute(lv.tmpl, line, lv.parent)}
+		resolved := substitute(lv.tmpl, line, lv.parent)
+		if isExec(resolved) {
+			return m, runExec(truncate(line, 40), execBody(resolved))
+		}
+		c := Cmd{Name: lv.title, Run: resolved}
 		m.chosen = &c
 		m.quitting = true
 		return m, tea.Quit
@@ -1082,6 +1132,8 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 		mark := " "
 		if isGen(c.Run) {
 			mark = "›"
+		} else if isExec(c.Run) {
+			mark = "↺"
 		}
 		name := pad(truncate(c.Name, nameW), nameW)
 		descW := w - nameW - lipgloss.Width(hits) - 4
@@ -1118,8 +1170,15 @@ func (m model) renderDetail(w int) string {
 				lines = append(lines, cPurp.Render("list ")+
 					cBase.Render(truncate(substitute(inList, line, lv.parent), inner-6)))
 			} else {
-				lines = append(lines, cCool.Render("$ ")+
-					cBase.Render(truncate(substitute(lv.tmpl, line, lv.parent), inner-3)))
+				r := substitute(lv.tmpl, line, lv.parent)
+				if isExec(r) {
+					lines = append(lines, cCool.Render("↺ ")+
+						cBase.Render(truncate(execBody(r), inner-3)),
+						cDim.Render("runs here, returns to sb when you quit it"))
+				} else {
+					lines = append(lines, cCool.Render("$ ")+
+						cBase.Render(truncate(r, inner-3)))
+				}
 			}
 		}
 	} else if c, ok := m.current(); ok {
@@ -1128,6 +1187,10 @@ func (m model) renderDetail(w int) string {
 			lines = append(lines,
 				cPurp.Render("list ")+cBase.Render(truncate(list, inner-6)),
 				cPurp.Render("run  ")+cBase.Render(truncate(tmpl, inner-6)))
+		} else if isExec(c.Run) {
+			lines = append(lines, cCool.Render("↺ ")+
+				cBase.Render(truncate(execBody(c.Run), inner-3)),
+				cDim.Render("runs here, returns to sb when you quit it"))
 		} else {
 			lines = append(lines, cCool.Render("$ ")+cBase.Render(truncate(c.Run, inner-3)))
 		}
