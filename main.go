@@ -82,8 +82,27 @@ func execBody(run string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(run), execPrefix))
 }
 
+// substitute fills the placeholders in a generator template:
+//
+//	{}        the whole selected line
+//	{1}..{9}  its whitespace-separated fields
+//	{^}       the whole line selected one level up
+//	{^1}..{^9} that line's fields
+//
+// The numbered parent form matters whenever the level above shows more than
+// the bare value — a project list with a note count, say. Without it, {^}
+// drags the count into the path.
 func substitute(tmpl, line, parent string) string {
-	out := strings.ReplaceAll(tmpl, "{^}", parent)
+	pf := strings.Fields(parent)
+	out := tmpl
+	for i := 1; i <= 9; i++ {
+		v := ""
+		if i-1 < len(pf) {
+			v = pf[i-1]
+		}
+		out = strings.ReplaceAll(out, fmt.Sprintf("{^%d}", i), v)
+	}
+	out = strings.ReplaceAll(out, "{^}", parent)
 	out = strings.ReplaceAll(out, "{}", line)
 	fields := strings.Fields(line)
 	for i := 1; i <= 9; i++ {
