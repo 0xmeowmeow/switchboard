@@ -333,42 +333,179 @@ func runGenerator(listCmd string) tea.Cmd {
 // ---------------------------------------------------------------- style
 
 const (
-	neonCyan   = "#00f0ff"
-	neonPurple = "#bf00ff"
-	neonPink   = "#ff2f92"
-	inkDark    = "#0a0a0f"
 )
 
 var (
-	cyanRGB   = [3]int{0x00, 0xf0, 0xff}
-	purpleRGB = [3]int{0xbf, 0x00, 0xff}
+	// Styles are rebuilt by applyTheme, never assigned at declaration —
+	// that is what makes live theme switching possible.
+	cBase, cDim, cFant, cCool, cWarn, cPurp lipgloss.Style
+	paneOn, paneOff                         lipgloss.Style
+	selOn, selOff                           lipgloss.Style
+	stTag, stMid, stEnd                     lipgloss.Style
 
-	cBase = lipgloss.NewStyle().Foreground(lipgloss.Color("#d8d8e8"))
-	cDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a5a72"))
-	cFant = lipgloss.NewStyle().Foreground(lipgloss.Color("#3a3a4c"))
-	cCool = lipgloss.NewStyle().Foreground(lipgloss.Color(neonCyan))
-	cWarn = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb020"))
-	cPurp = lipgloss.NewStyle().Foreground(lipgloss.Color(neonPurple))
+	gradFrom, gradTo [3]int
 
-	// panes: the focused one gets a cyan border, the other recedes
-	paneOn = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(neonCyan)).Padding(0, 1)
-	paneOff = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#2a2a38")).Padding(0, 1)
-
-	// selection: inverse video when the pane has focus, quiet when it doesn't
-	selOn = lipgloss.NewStyle().Foreground(lipgloss.Color(inkDark)).
-		Background(lipgloss.Color(neonCyan)).Bold(true)
-	selOff = lipgloss.NewStyle().Foreground(lipgloss.Color(neonCyan)).Bold(true)
-
-	// status bar segments, in the style of the lipgloss demo
-	stTag = lipgloss.NewStyle().Foreground(lipgloss.Color(inkDark)).
-		Background(lipgloss.Color(neonPink)).Bold(true).Padding(0, 1)
-	stMid = lipgloss.NewStyle().Foreground(lipgloss.Color("#d8d8e8")).
-		Background(lipgloss.Color("#1c1c28")).Padding(0, 1)
-	stEnd = lipgloss.NewStyle().Foreground(lipgloss.Color(inkDark)).
-		Background(lipgloss.Color(neonPurple)).Bold(true).Padding(0, 1)
+	// index into themes; the whole UI reads its colours through applyTheme
+	curTheme int
 )
+
+// Palette is a theme. Six colours plus two neutrals is enough for the whole
+// UI; anything more and themes stop being writable by hand.
+type Palette struct {
+	Name   string
+	Accent string // focus borders, item names, the gradient start
+	Second string // group headings, generator marks, the gradient end
+	Hot    string // status tag, filter prompt
+	Ink    string // body text
+	Dim    string // descriptions
+	Faint  string // unfocused borders, inert marks
+	Warn   string // notes and errors
+	Dark   string // text drawn ON an accent background
+	Bar    string // status bar middle background
+}
+
+var themes = []Palette{
+	{Name: "cyberpunk", Accent: "#00f0ff", Second: "#bf00ff", Hot: "#ff2f92",
+		Ink: "#d8d8e8", Dim: "#5a5a72", Faint: "#3a3a4c", Warn: "#ffb020",
+		Dark: "#0a0a0f", Bar: "#1c1c28"},
+	// Derived from the 80's Neon TV Obsidian theme: --accent-1 magenta,
+	// --accent-2 cyan, with its Dracula-ish muted set for the quiet tones.
+	{Name: "neon-tv", Accent: "#00FFFF", Second: "#FF00FF", Hot: "#FF1690",
+		Ink: "#f8f8f2", Dim: "#7a6ae6", Faint: "#44406a", Warn: "#ffd319",
+		Dark: "#12101f", Bar: "#1b1730"},
+	{Name: "vapor", Accent: "#FF6EC7", Second: "#8be9fd", Hot: "#ffd319",
+		Ink: "#f2e9f7", Dim: "#8a7fa8", Faint: "#4a4260", Warn: "#ffb86c",
+		Dark: "#14101c", Bar: "#221a2e"},
+	{Name: "matrix", Accent: "#00FF00", Second: "#50fa7b", Hot: "#8be9fd",
+		Ink: "#c8f7c8", Dim: "#3f7a3f", Faint: "#264d26", Warn: "#ffd319",
+		Dark: "#00140a", Bar: "#0a1f12"},
+	{Name: "amber", Accent: "#ffb000", Second: "#ff7000", Hot: "#ffd319",
+		Ink: "#ffd9a0", Dim: "#8a6320", Faint: "#4a3510", Warn: "#ff5555",
+		Dark: "#140c00", Bar: "#241a08"},
+	{Name: "mono", Accent: "#e8e8e8", Second: "#a0a0a0", Hot: "#ffffff",
+		Ink: "#d0d0d0", Dim: "#6a6a6a", Faint: "#3a3a3a", Warn: "#c0c0c0",
+		Dark: "#0a0a0a", Bar: "#1a1a1a"},
+}
+
+func hex3(h string) [3]int {
+	var r, g, b int
+	fmt.Sscanf(strings.TrimPrefix(h, "#"), "%02x%02x%02x", &r, &g, &b)
+	return [3]int{r, g, b}
+}
+
+func fg(c string) lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(c))
+}
+
+func applyTheme(p Palette) {
+	cBase = fg(p.Ink)
+	cDim = fg(p.Dim)
+	cFant = fg(p.Faint)
+	cCool = fg(p.Accent)
+	cWarn = fg(p.Warn)
+	cPurp = fg(p.Second)
+
+	paneOn = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(p.Accent)).Padding(0, 1)
+	paneOff = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(p.Faint)).Padding(0, 1)
+
+	selOn = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Dark)).
+		Background(lipgloss.Color(p.Accent)).Bold(true)
+	selOff = fg(p.Accent).Bold(true)
+
+	stTag = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Dark)).
+		Background(lipgloss.Color(p.Hot)).Bold(true).Padding(0, 1)
+	stMid = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Ink)).
+		Background(lipgloss.Color(p.Bar)).Padding(0, 1)
+	stEnd = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Dark)).
+		Background(lipgloss.Color(p.Second)).Bold(true).Padding(0, 1)
+
+	gradFrom, gradTo = hex3(p.Accent), hex3(p.Second)
+}
+
+func themePath() string { return filepath.Join(confDir(), "theme") }
+
+// loadTheme reads the saved theme name. A user theme file at
+// ~/.config/switchboard/themes/<name>.conf overrides a built-in of the same
+// name; the format is one "key = #rrggbb" per line.
+func loadTheme() int {
+	b, err := os.ReadFile(themePath())
+	if err != nil {
+		return 0
+	}
+	want := strings.TrimSpace(string(b))
+	for i, p := range themes {
+		if p.Name == want {
+			return i
+		}
+	}
+	return 0
+}
+
+func saveTheme(name string) {
+	os.MkdirAll(confDir(), 0755)
+	os.WriteFile(themePath(), []byte(name+"\n"), 0644)
+}
+
+// loadUserThemes merges ~/.config/switchboard/themes/*.conf over the
+// built-ins, so a hand-written theme appears in the same cycle.
+func loadUserThemes() {
+	dir := filepath.Join(confDir(), "themes")
+	files, _ := filepath.Glob(filepath.Join(dir, "*.conf"))
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		p := Palette{Name: strings.TrimSuffix(filepath.Base(f), ".conf")}
+		base := themes[0]
+		p.Accent, p.Second, p.Hot = base.Accent, base.Second, base.Hot
+		p.Ink, p.Dim, p.Faint = base.Ink, base.Dim, base.Faint
+		p.Warn, p.Dark, p.Bar = base.Warn, base.Dark, base.Bar
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") && !strings.Contains(line, "=") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			k, v = strings.ToLower(strings.TrimSpace(k)), strings.TrimSpace(v)
+			switch k {
+			case "accent":
+				p.Accent = v
+			case "second":
+				p.Second = v
+			case "hot":
+				p.Hot = v
+			case "ink":
+				p.Ink = v
+			case "dim":
+				p.Dim = v
+			case "faint":
+				p.Faint = v
+			case "warn":
+				p.Warn = v
+			case "dark":
+				p.Dark = v
+			case "bar":
+				p.Bar = v
+			}
+		}
+		replaced := false
+		for i := range themes {
+			if themes[i].Name == p.Name {
+				themes[i] = p
+				replaced = true
+			}
+		}
+		if !replaced {
+			themes = append(themes, p)
+		}
+	}
+}
 
 func lerp(a, b [3]int, t float64) lipgloss.Color {
 	f := func(i int) int { return a[i] + int(float64(b[i]-a[i])*t) }
@@ -383,7 +520,7 @@ func gradient(s string, bold bool) string {
 		if len(r) > 1 {
 			t = float64(i) / float64(len(r)-1)
 		}
-		st := lipgloss.NewStyle().Foreground(lerp(cyanRGB, purpleRGB, t))
+		st := lipgloss.NewStyle().Foreground(lerp(gradFrom, gradTo, t))
 		if bold {
 			st = st.Bold(true)
 		}
@@ -489,11 +626,14 @@ func newInput(placeholder, prompt string, limit int) textinput.Model {
 	t.Placeholder = placeholder
 	t.Prompt = prompt
 	t.CharLimit = limit
-	t.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(neonPink))
+	t.PromptStyle = fg(themes[curTheme].Hot)
 	return t
 }
 
 func initialModel() model {
+	loadUserThemes()
+	curTheme = loadTheme()
+	applyTheme(themes[curTheme])
 	u := loadUsage()
 	cmds, err := loadCommands(u)
 	m := model{cmds: cmds, usage: u, bannerTxt: customBanner(), w: 80, h: 24}
@@ -807,6 +947,18 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.chosen = &c
 		m.quitting = true
 		return m, tea.Quit
+
+	case "t", "T":
+		if msg.String() == "t" {
+			curTheme = (curTheme + 1) % len(themes)
+		} else {
+			curTheme = (curTheme - 1 + len(themes)) % len(themes)
+		}
+		applyTheme(themes[curTheme])
+		m.filter.PromptStyle = fg(themes[curTheme].Hot)
+		saveTheme(themes[curTheme].Name)
+		m.status = "theme: " + themes[curTheme].Name
+		return m, nil
 
 	case "a":
 		m.mode = modeAdd
@@ -1228,7 +1380,7 @@ func (m model) renderDetail(w int) string {
 // renderStatus is the bar along the bottom, segmented like the lipgloss demo.
 func (m model) renderStatus(w int, inGen bool) string {
 	tag := "SB"
-	keys := "↵ run  tab pane  / filter  a add  d del  e edit  q quit"
+	keys := "↵ run  tab pane  / filter  t theme  a add  d del  e edit  q quit"
 	if inGen {
 		tag = "LIST"
 		keys = "↵ run  h back  / filter  q back"
