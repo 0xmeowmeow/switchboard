@@ -576,6 +576,7 @@ const (
 	modeAdd
 	modeConfirmDelete
 	modeGen
+	modeStudy
 )
 
 type focus int
@@ -619,6 +620,10 @@ type model struct {
 
 	stack   []genLevel
 	genLoad bool
+
+	// study mode: a reader/tracker over the vault's markdown notes
+	study          *studyState
+	studyFiltering bool
 }
 
 func newInput(placeholder, prompt string, limit int) textinput.Model {
@@ -808,6 +813,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(msg)
 		case modeGen:
 			return m.updateGen(msg)
+		case modeStudy:
+			return m.updateStudy(msg)
 		default:
 			return m.updateList(msg)
 		}
@@ -822,6 +829,13 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterText = ""
 		m.filter.SetValue("")
 		m.filter.Blur()
+		if m.study != nil && m.studyFiltering {
+			m.study.filter = ""
+			m.study.refilter()
+			m.studyFiltering = false
+			m.mode = modeStudy
+			return m, nil
+		}
 		m.mode = modeList
 		if len(m.stack) > 0 {
 			m.mode = modeGen
@@ -832,6 +846,13 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		m.filter.Blur()
+		if m.study != nil && m.studyFiltering {
+			m.study.filter = m.filterText
+			m.study.refilter()
+			m.studyFiltering = false
+			m.mode = modeStudy
+			return m, nil
+		}
 		m.mode = modeList
 		if len(m.stack) > 0 {
 			m.mode = modeGen
@@ -843,6 +864,11 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.filter, cmd = m.filter.Update(msg)
 	m.filterText = m.filter.Value()
+	if m.study != nil && m.studyFiltering {
+		m.study.filter = m.filterText
+		m.study.refilter()
+		return m, cmd
+	}
 	if len(m.stack) > 0 {
 		m.regenFilter()
 	} else {
@@ -958,6 +984,14 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filter.PromptStyle = fg(themes[curTheme].Hot)
 		saveTheme(themes[curTheme].Name)
 		m.status = "theme: " + themes[curTheme].Name
+		return m, nil
+
+	case "S":
+		if m.study == nil {
+			m.study = newStudyState()
+		}
+		m.mode = modeStudy
+		m.status = ""
 		return m, nil
 
 	case "a":
@@ -1128,6 +1162,8 @@ func (m model) View() string {
 		return m.viewAdd()
 	case modeConfirmDelete:
 		return m.viewConfirm()
+	case modeStudy:
+		return m.viewStudy()
 	}
 	return m.viewMain()
 }
@@ -1380,7 +1416,7 @@ func (m model) renderDetail(w int) string {
 // renderStatus is the bar along the bottom, segmented like the lipgloss demo.
 func (m model) renderStatus(w int, inGen bool) string {
 	tag := "SB"
-	keys := "↵ run  tab pane  / filter  t theme  a add  d del  e edit  q quit"
+	keys := "↵ run  tab pane  / filter  S study  t theme  a add  d del  e edit  q quit"
 	if inGen {
 		tag = "LIST"
 		keys = "↵ run  h back  / filter  q back"
