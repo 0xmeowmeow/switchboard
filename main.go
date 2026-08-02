@@ -33,6 +33,9 @@ import (
 	"syscall"
 	"time"
 
+	"switchboard/decor"
+
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -47,6 +50,9 @@ type Cmd struct {
 	Run   string
 	Note  string
 }
+
+// decorMargin is how many columns of backdrop show either side.
+const decorMargin = 4
 
 const genPrefix = "@gen"
 
@@ -342,6 +348,7 @@ var (
 	paneOn, paneOff                         lipgloss.Style
 	selOn, selOff                           lipgloss.Style
 	stTag, stMid, stEnd                     lipgloss.Style
+	cDeco, cCanvas                          lipgloss.Style
 
 	gradFrom, gradTo [3]int
 
@@ -362,27 +369,36 @@ type Palette struct {
 	Warn   string // notes and errors
 	Dark   string // text drawn ON an accent background
 	Bar    string // status bar middle background
+	Bg     string // the app's own background — sb stops showing your terminal's
+	Glyph  string // space-separated glyphs tiled faintly behind the panes
+	Deco   string // colour of that backdrop; keep it close to Bg
 }
 
 var themes = []Palette{
 	{Name: "cyberpunk", Accent: "#00f0ff", Second: "#bf00ff", Hot: "#ff2f92",
+		Bg: "#07070d", Glyph: "░ ▒ ░ ▓", Deco: "#15152b",
 		Ink: "#d8d8e8", Dim: "#5a5a72", Faint: "#3a3a4c", Warn: "#ffb020",
 		Dark: "#0a0a0f", Bar: "#1c1c28"},
 	// Derived from the 80's Neon TV Obsidian theme: --accent-1 magenta,
 	// --accent-2 cyan, with its Dracula-ish muted set for the quiet tones.
 	{Name: "neon-tv", Accent: "#00FFFF", Second: "#FF00FF", Hot: "#FF1690",
+		Bg: "#0d0a18", Glyph: "猫 咪", Deco: "#241a3d",
 		Ink: "#f8f8f2", Dim: "#7a6ae6", Faint: "#44406a", Warn: "#ffd319",
 		Dark: "#12101f", Bar: "#1b1730"},
 	{Name: "vapor", Accent: "#FF6EC7", Second: "#8be9fd", Hot: "#ffd319",
+		Bg: "#0f0b16", Glyph: "◢ ◣ ◥ ◤", Deco: "#2a1f3a",
 		Ink: "#f2e9f7", Dim: "#8a7fa8", Faint: "#4a4260", Warn: "#ffb86c",
 		Dark: "#14101c", Bar: "#221a2e"},
 	{Name: "matrix", Accent: "#00FF00", Second: "#50fa7b", Hot: "#8be9fd",
+		Bg: "#000d06", Glyph: "ｱ ｲ ｳ ｴ ｵ ﾊ ﾋ ﾌ", Deco: "#0d2b18",
 		Ink: "#c8f7c8", Dim: "#3f7a3f", Faint: "#264d26", Warn: "#ffd319",
 		Dark: "#00140a", Bar: "#0a1f12"},
 	{Name: "amber", Accent: "#ffb000", Second: "#ff7000", Hot: "#ffd319",
+		Bg: "#0f0900", Glyph: "· ˙ ·", Deco: "#2e2008",
 		Ink: "#ffd9a0", Dim: "#8a6320", Faint: "#4a3510", Warn: "#ff5555",
 		Dark: "#140c00", Bar: "#241a08"},
 	{Name: "mono", Accent: "#e8e8e8", Second: "#a0a0a0", Hot: "#ffffff",
+		Bg: "#070707", Glyph: "▚ ▞", Deco: "#1a1a1a",
 		Ink: "#d0d0d0", Dim: "#6a6a6a", Faint: "#3a3a3a", Warn: "#c0c0c0",
 		Dark: "#0a0a0a", Bar: "#1a1a1a"},
 }
@@ -421,7 +437,28 @@ func applyTheme(p Palette) {
 	stEnd = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Dark)).
 		Background(lipgloss.Color(p.Second)).Bold(true).Padding(0, 1)
 
+	cDeco = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Deco)).
+		Background(lipgloss.Color(p.Bg))
+	cCanvas = lipgloss.NewStyle().Background(lipgloss.Color(p.Bg))
+
+	// every pane and label sits ON the app background, not the terminal's
+	for _, st := range []*lipgloss.Style{&cBase, &cDim, &cFant, &cCool, &cWarn,
+		&cPurp, &paneOn, &paneOff, &selOff} {
+		*st = st.Background(lipgloss.Color(p.Bg))
+	}
+
 	gradFrom, gradTo = hex3(p.Accent), hex3(p.Second)
+	saveThemeJSON(p)
+}
+
+// saveThemeJSON publishes the active palette so other tools — a Textual app,
+// a script, anything — can wear the same colours. This is what makes separate
+// binaries feel like one environment; a shared codebase is not required.
+func saveThemeJSON(p Palette) {
+	os.MkdirAll(confDir(), 0755)
+	if b, err := json.MarshalIndent(p, "", "  "); err == nil {
+		os.WriteFile(filepath.Join(confDir(), "theme.json"), b, 0644)
+	}
 }
 
 func themePath() string { return filepath.Join(confDir(), "theme") }
@@ -463,6 +500,7 @@ func loadUserThemes() {
 		p.Accent, p.Second, p.Hot = base.Accent, base.Second, base.Hot
 		p.Ink, p.Dim, p.Faint = base.Ink, base.Dim, base.Faint
 		p.Warn, p.Dark, p.Bar = base.Warn, base.Dark, base.Bar
+		p.Bg, p.Glyph, p.Deco = base.Bg, base.Glyph, base.Deco
 		for _, line := range strings.Split(string(b), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") && !strings.Contains(line, "=") {
@@ -492,6 +530,12 @@ func loadUserThemes() {
 				p.Dark = v
 			case "bar":
 				p.Bar = v
+			case "bg":
+				p.Bg = v
+			case "glyph", "glyphs":
+				p.Glyph = v
+			case "deco":
+				p.Deco = v
 			}
 		}
 		replaced := false
@@ -520,7 +564,8 @@ func gradient(s string, bold bool) string {
 		if len(r) > 1 {
 			t = float64(i) / float64(len(r)-1)
 		}
-		st := lipgloss.NewStyle().Foreground(lerp(gradFrom, gradTo, t))
+		st := lipgloss.NewStyle().Foreground(lerp(gradFrom, gradTo, t)).
+			Background(lipgloss.Color(themes[curTheme].Bg))
 		if bold {
 			st = st.Bold(true)
 		}
@@ -620,6 +665,8 @@ type model struct {
 
 	stack   []genLevel
 	genLoad bool
+	spin    spinner.Model
+	art     []decor.Art
 
 	// study mode: a reader/tracker over the vault's markdown notes
 	study          *studyState
@@ -645,6 +692,9 @@ func initialModel() model {
 	if err != nil {
 		m.status = "could not read config: " + err.Error()
 	}
+	m.art = decor.LoadArt(60, 14)
+	m.spin = spinner.New()
+	m.spin.Spinner = spinner.Dot
 	m.filter = newInput("filter", "  / ", 40)
 
 	labels := []string{"group", "name", "description", "command", "note (optional)"}
@@ -732,7 +782,8 @@ func (m *model) push(title, listCmd, tmpl, parent string) tea.Cmd {
 	m.filterText = ""
 	m.filter.SetValue("")
 	m.status = ""
-	return runGenerator(listCmd)
+	m.spin.Style = cCool
+	return tea.Batch(runGenerator(listCmd), m.spin.Tick)
 }
 
 func (m *model) pop() {
@@ -772,6 +823,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 		return m, nil
+
+	case spinner.TickMsg:
+		if !m.genLoad {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		return m, cmd
 
 	case execDoneMsg:
 		if msg.err != nil {
@@ -1153,25 +1212,100 @@ func errText(err error) string {
 
 // ---------------------------------------------------------------- view
 
+// canvas paints the app's own background, tiles the theme's glyph pattern
+// faintly across it, and composites the interface on top. Gaps in the
+// interface show the pattern rather than the terminal underneath.
+func (m model) canvas(content string) string {
+	w, h := m.w, m.h
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	p := themes[curTheme]
+	glyphs := strings.Fields(p.Glyph)
+	lines := strings.Split(content, "\n")
+
+	if len(glyphs) == 0 {
+		// no pattern: still paint the background so we do not show through
+		out := make([]string, 0, len(lines))
+		for _, l := range lines {
+			pad := w - lipgloss.Width(l)
+			if pad < 0 {
+				pad = 0
+			}
+			out = append(out, cCanvas.Render(l+strings.Repeat(" ", pad)))
+		}
+		return strings.Join(out, "\n")
+	}
+
+	bg := decor.Tile(glyphs, w, h, lipgloss.Width)
+	for i := range bg {
+		bg[i] = cDeco.Render(bg[i])
+	}
+	// centre the interface horizontally, leaving pattern down both sides
+	cw := 0
+	for _, l := range lines {
+		if x := lipgloss.Width(l); x > cw {
+			cw = x
+		}
+	}
+	x := (w - cw) / 2
+	if x < 0 {
+		x = 0
+	}
+	y := 1
+	if len(lines)+y > h {
+		y = 0
+	}
+	out := decor.Overlay(bg, lines, x, y, lipgloss.Width)
+
+	// a piece of art from ~/.config/switchboard/decor/, bottom-left of the
+	// margin if it fits. Purely optional: no files, nothing drawn.
+	if a := decor.PickArt(m.art, curTheme); a != nil {
+		aw := 0
+		for _, l := range a.Lines {
+			if v := lipgloss.Width(l); v > aw {
+				aw = v
+			}
+		}
+		ay := h - len(a.Lines) - 1
+		if aw <= x-2 && ay > y {
+			art := make([]string, len(a.Lines))
+			for i, l := range a.Lines {
+				if a.Colour {
+					art[i] = l
+				} else {
+					art[i] = cDeco.Render(l)
+				}
+			}
+			out = decor.Overlay(out, art, 1, ay, lipgloss.Width)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
 func (m model) View() string {
 	if m.quitting {
 		return ""
 	}
 	switch m.mode {
 	case modeAdd:
-		return m.viewAdd()
+		return m.canvas(m.viewAdd())
 	case modeConfirmDelete:
-		return m.viewConfirm()
+		return m.canvas(m.viewConfirm())
 	case modeStudy:
-		return m.viewStudy()
+		return m.canvas(m.viewStudy())
 	}
-	return m.viewMain()
+	return m.canvas(m.viewMain())
 }
 
 // geometry derives every dimension from the terminal size, so nothing is
 // hardcoded and the layout degrades instead of breaking.
 func (m model) geometry() (railW, itemW, rows int) {
-	w := m.w
+	// inset so the backdrop pattern shows as a margin on all sides
+	w := m.w - 2*decorMargin
 	if w < 40 {
 		w = 40
 	}
@@ -1188,7 +1322,7 @@ func (m model) geometry() (railW, itemW, rows int) {
 	if m.bannerTxt != "" {
 		bannerH = strings.Count(m.bannerTxt, "\n") + 1
 	}
-	rows = m.h - bannerH - 8 // panes + detail(3) + status(1) + margins
+	rows = m.h - bannerH - 10 // panes + detail(3) + status(1) + margins
 	if rows < 3 {
 		rows = 3
 	}
@@ -1287,7 +1421,7 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 		}
 		b.WriteString(paneTitle(title, w, true) + "\n")
 		if m.genLoad {
-			b.WriteString(cDim.Render("running…"))
+			b.WriteString(m.spin.View() + cDim.Render(" running the generator…"))
 			return b.String()
 		}
 		if lv == nil || len(lv.shown) == 0 {
