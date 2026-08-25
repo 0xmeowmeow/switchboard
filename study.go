@@ -1,14 +1,31 @@
-// study.go — a reading tracker inside sb.
+// study.go — read, answer, move on.
 //
-// The markdown IS the database. Every chapter is a note under
-// ~/vault/learn/<doc>/NN-*.md with YAML frontmatter and GitHub-style
-// checkboxes. This mode reads those files, lets you tick boxes and change
-// status, and writes the same files back — so Obsidian sees every change
-// immediately and there is nothing to export.
+// The markdown is the database. Every lesson is a note under
+// ~/vault/learn/<course>/NN-*.md; sb reads it, lets you answer its questions,
+// and writes the same file back in place, so Obsidian sees every change and
+// there is nothing to export.
 //
-// Writes are deliberately minimal: only the `status:` line and the `- [ ]`
-// markers are touched, every other byte is preserved. That keeps the diffs
-// readable in Obsidian Git.
+// Three rules, all learned from using the previous version:
+//
+//   - Open where you left off. The order was decided when the course was
+//     written. Making you re-choose it every session spends cognitive load on
+//     a question that already has an answer.
+//   - One thing on screen. Lessons on the left, the current question and your
+//     answer in the middle. Nothing else.
+//   - Every frame is exactly as tall as the terminal. lipgloss Height() is a
+//     minimum, not a maximum: a pane taller than its allocation expands the
+//     frame, the alt screen scrolls, and the display jumps as the selection
+//     moves. Content is clipped before it reaches the layout.
+//
+// Question format in the note:
+//
+//	## Questions
+//	### What does each factor of L = BᵀB mean?
+//	A: the incidence matrix is the discrete gradient, its transpose the
+//	   divergence, so L is div of grad.
+//
+// A `###` heading is a question. Everything after `A:` until the next heading
+// is your answer.
 package main
 
 import (
@@ -18,34 +35,65 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"switchboard/decor"
 )
 
 // ---------------------------------------------------------------- model
 
+type question struct {
+	text   string
+	answer string
+	line   int // index in raw of the `###` heading
+	end    int // last line belonging to this answer
+}
+
+func (q question) answered() bool { return strings.TrimSpace(q.answer) != "" }
+
 type check struct {
 	done bool
 	text string
-	line int // index into raw, so we can write back in place
+	line int
 }
 
 type chapter struct {
 	path     string
-	doc      string // parent directory, e.g. laplacian-reader
+	course   string
 	title    string
-	source   string // the PDF, relative to the vault
+	source   string
 	num      int
 	priority int
-	status   string // todo, reading, done, parked
+	status   string
+	prose    []string
 	checks   []check
-	gotcha   []string
-	notes    []string
+	quest    []question
+	diagram  string
 	raw      []string
-	statLine int // index of the status: line in raw
+	statLine int
 }
 
-func (c *chapter) doneCount() (int, int) {
+// toggle ticks a checkbox by rewriting that one line. The whole reason this
+// is here rather than in the editor: `- [ ]` to `- [x]` is four keystrokes and
+// a cursor position in vim, and one keystroke here.
+func (c *chapter) toggle(i int) {
+	if i < 0 || i >= len(c.checks) {
+		return
+	}
+	k := &c.checks[i]
+	k.done = !k.done
+	from, to := "- [ ]", "- [x]"
+	if !k.done {
+		from, to = "- [x]", "- [ ]"
+	}
+	if k.line >= 0 && k.line < len(c.raw) {
+		c.raw[k.line] = strings.Replace(c.raw[k.line], from, to, 1)
+	}
+}
+
+func (c *chapter) checkCount() (int, int) {
 	n := 0
 	for _, k := range c.checks {
 		if k.done {
@@ -55,44 +103,89 @@ func (c *chapter) doneCount() (int, int) {
 	return n, len(c.checks)
 }
 
-// complete is the honest definition: a chapter with checks is done when they
-// pass, not when it has been marked read.
+// items is how many things there are to work through: checks then questions,
+// in one list, because from the keyboard they are the same motion.
+func (c *chapter) items() int { return len(c.checks) + len(c.quest) }
+
+func (c *chapter) answeredCount() (int, int) {
+	n := 0
+	for _, q := range c.quest {
+		if q.answered() {
+			n++
+		}
+	}
+	return n, len(c.quest)
+}
+
+// complete is the honest definition: answered, not merely opened.
 func (c *chapter) complete() bool {
 	if c.status == "done" {
 		return true
 	}
-	d, t := c.doneCount()
-	return t > 0 && d == t
+	a, at := c.answeredCount()
+	k, kt := c.checkCount()
+	if at+kt == 0 {
+		return false
+	}
+	return a == at && k == kt
+}
+
+func (c *chapter) doneAll() bool {
+	a, at := c.answeredCount()
+	k, kt := c.checkCount()
+	return at+kt > 0 && a == at && k == kt
 }
 
 var statusCycle = []string{"todo", "reading", "done", "parked"}
 
-func (c *chapter) cycleStatus(dir int) {
+func (c *chapter) setStatus(s string) {
+	c.status = s
+	if c.statLine >= 0 && c.statLine < len(c.raw) {
+		c.raw[c.statLine] = "status: " + s
+	}
+}
+
+func (c *chapter) cycleStatus() {
 	i := 0
 	for j, s := range statusCycle {
 		if s == c.status {
 			i = j
 		}
 	}
-	i = (i + dir + len(statusCycle)) % len(statusCycle)
-	c.status = statusCycle[i]
-	if c.statLine >= 0 && c.statLine < len(c.raw) {
-		c.raw[c.statLine] = "status: " + c.status
-	}
+	c.setStatus(statusCycle[(i+1)%len(statusCycle)])
 }
 
-func (c *chapter) toggle(i int) {
-	if i < 0 || i >= len(c.checks) {
+// setAnswer rewrites one answer block, leaving every other byte alone so the
+// Obsidian Git diff stays small.
+func (c *chapter) setAnswer(i int, text string) {
+	if i < 0 || i >= len(c.quest) {
 		return
 	}
-	k := &c.checks[i]
-	k.done = !k.done
-	old, new := "- [ ]", "- [x]"
-	if !k.done {
-		old, new = "- [x]", "- [ ]"
+	q := &c.quest[i]
+	var body []string
+	if strings.TrimSpace(text) != "" {
+		for j, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+			if j == 0 {
+				body = append(body, "A: "+line)
+			} else {
+				body = append(body, "   "+line)
+			}
+		}
 	}
-	if k.line >= 0 && k.line < len(c.raw) {
-		c.raw[k.line] = strings.Replace(c.raw[k.line], old, new, 1)
+
+	tail := append([]string{}, c.raw[q.end+1:]...)
+	head := append([]string{}, c.raw[:q.line+1]...)
+	c.raw = append(head, append(body, tail...)...)
+	q.answer = text
+
+	delta := (q.line + 1 + len(body)) - (q.end + 1)
+	q.end = q.line + len(body)
+	for j := i + 1; j < len(c.quest); j++ {
+		c.quest[j].line += delta
+		c.quest[j].end += delta
+	}
+	if c.statLine > q.line {
+		c.statLine += delta
 	}
 }
 
@@ -112,21 +205,13 @@ func learnDir() string {
 
 func vaultDir() string { return filepath.Dir(learnDir()) }
 
-func frontmatterValue(line, key string) (string, bool) {
-	if !strings.HasPrefix(line, key+":") {
-		return "", false
-	}
-	return strings.TrimSpace(strings.TrimPrefix(line, key+":")), true
-}
-
 func parseChapter(path string) (*chapter, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	c := &chapter{
-		path:     path,
-		doc:      filepath.Base(filepath.Dir(path)),
+		path: path, course: filepath.Base(filepath.Dir(path)),
 		title:    strings.TrimSuffix(filepath.Base(path), ".md"),
 		status:   "todo",
 		priority: 9,
@@ -137,9 +222,9 @@ func parseChapter(path string) (*chapter, error) {
 	inFront, seenFront := false, false
 	section := ""
 	for i, line := range c.raw {
-		trimmed := strings.TrimSpace(line)
+		t := strings.TrimSpace(line)
 
-		if trimmed == "---" && !seenFront {
+		if t == "---" && !seenFront {
 			if inFront {
 				inFront, seenFront = false, true
 			} else {
@@ -148,37 +233,52 @@ func parseChapter(path string) (*chapter, error) {
 			continue
 		}
 		if inFront {
-			if v, ok := frontmatterValue(trimmed, "title"); ok {
+			k, v, ok := strings.Cut(t, ":")
+			if !ok {
+				continue
+			}
+			v = strings.TrimSpace(v)
+			switch strings.TrimSpace(k) {
+			case "title":
 				c.title = v
-			}
-			if v, ok := frontmatterValue(trimmed, "source"); ok {
+			case "source":
 				c.source = v
-			}
-			if v, ok := frontmatterValue(trimmed, "status"); ok {
+			case "status":
 				c.status, c.statLine = v, i
-			}
-			if v, ok := frontmatterValue(trimmed, "priority"); ok {
+			case "priority":
 				fmt.Sscanf(v, "%d", &c.priority)
-			}
-			if v, ok := frontmatterValue(trimmed, "chapter"); ok {
+			case "chapter":
 				fmt.Sscanf(v, "%d", &c.num)
+			case "diagram":
+				c.diagram = v
 			}
 			continue
 		}
 
-		if strings.HasPrefix(trimmed, "## ") {
-			section = strings.ToLower(strings.TrimPrefix(trimmed, "## "))
-			continue
-		}
 		switch {
-		case strings.HasPrefix(trimmed, "- [ ]"):
-			c.checks = append(c.checks, check{false, strings.TrimSpace(trimmed[5:]), i})
-		case strings.HasPrefix(trimmed, "- [x]"), strings.HasPrefix(trimmed, "- [X]"):
-			c.checks = append(c.checks, check{true, strings.TrimSpace(trimmed[5:]), i})
-		case strings.HasPrefix(trimmed, ">"):
-			c.gotcha = append(c.gotcha, strings.TrimSpace(strings.TrimPrefix(trimmed, ">")))
-		case section == "notes" && trimmed != "":
-			c.notes = append(c.notes, trimmed)
+		case strings.HasPrefix(t, "- [ ]"):
+			c.checks = append(c.checks, check{false, strings.TrimSpace(t[5:]), i})
+		case strings.HasPrefix(t, "- [x]"), strings.HasPrefix(t, "- [X]"):
+			c.checks = append(c.checks, check{true, strings.TrimSpace(t[5:]), i})
+		case strings.HasPrefix(t, "### "):
+			c.quest = append(c.quest, question{
+				text: strings.TrimSpace(t[4:]), line: i, end: i,
+			})
+			section = "q"
+		case strings.HasPrefix(t, "## "):
+			section = strings.ToLower(strings.TrimPrefix(t, "## "))
+		case section == "q" && len(c.quest) > 0:
+			q := &c.quest[len(c.quest)-1]
+			switch {
+			case strings.HasPrefix(t, "A:"):
+				q.answer = strings.TrimSpace(t[2:])
+				q.end = i
+			case q.answer != "" && t != "":
+				q.answer += "\n" + t
+				q.end = i
+			}
+		case (section == "text" || section == "chapter") && t != "":
+			c.prose = append(c.prose, t)
 		}
 	}
 	return c, nil
@@ -186,8 +286,7 @@ func parseChapter(path string) (*chapter, error) {
 
 func loadChapters() []*chapter {
 	var out []*chapter
-	root := learnDir()
-	filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+	filepath.Walk(learnDir(), func(p string, info os.FileInfo, err error) error {
 		if err != nil || info == nil || info.IsDir() {
 			return nil
 		}
@@ -199,84 +298,83 @@ func loadChapters() []*chapter {
 		}
 		return nil
 	})
-	// priority first — that ordering is the whole point of the reading plan
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].priority != out[j].priority {
-			return out[i].priority < out[j].priority
+		a, b := out[i], out[j]
+		if a.priority != b.priority {
+			return a.priority < b.priority
 		}
-		if out[i].doc != out[j].doc {
-			return out[i].doc < out[j].doc
+		if a.course != b.course {
+			return a.course < b.course
 		}
-		return out[i].num < out[j].num
+		return a.num < b.num
 	})
 	return out
 }
 
 // ---------------------------------------------------------------- state
 
-type studyFocus int
-
-const (
-	focusChapters studyFocus = iota
-	focusChecks
-)
-
 type studyState struct {
 	chapters []*chapter
 	sel      int
-	checkSel int
-	focus    studyFocus
+	qsel     int
+	editing  bool
+	area     textarea.Model
 	msg      string
-	filter   string
-	shown    []int
 }
 
 func newStudyState() *studyState {
 	s := &studyState{chapters: loadChapters()}
-	s.refilter()
-	// open on the first thing that is not finished
-	for i, idx := range s.shown {
-		if !s.chapters[idx].complete() {
-			s.sel = i
-			break
+	ta := textarea.New()
+	ta.Placeholder = "short answer — enough to show you took it in"
+	ta.ShowLineNumbers = false
+	ta.SetHeight(4)
+	s.area = ta
+
+	// open where you left off: first unfinished lesson, first unfinished item
+	for i, c := range s.chapters {
+		if c.complete() {
+			continue
 		}
+		s.sel = i
+		s.qsel = 0
+		for j, k := range c.checks {
+			if !k.done {
+				s.qsel = j
+				break
+			}
+		}
+		if k, kt := c.checkCount(); k == kt {
+			for j, q := range c.quest {
+				if !q.answered() {
+					s.qsel = len(c.checks) + j
+					break
+				}
+			}
+		}
+		break
 	}
 	return s
 }
 
-func (s *studyState) refilter() {
-	q := strings.ToLower(s.filter)
-	s.shown = s.shown[:0]
-	for i, c := range s.chapters {
-		if q == "" ||
-			strings.Contains(strings.ToLower(c.title), q) ||
-			strings.Contains(strings.ToLower(c.doc), q) ||
-			strings.Contains(strings.ToLower(c.status), q) {
-			s.shown = append(s.shown, i)
-		}
-	}
-	if s.sel >= len(s.shown) {
-		s.sel = maxi(0, len(s.shown)-1)
-	}
-}
-
 func (s *studyState) current() *chapter {
-	if len(s.shown) == 0 {
+	if len(s.chapters) == 0 {
 		return nil
 	}
-	return s.chapters[s.shown[s.sel]]
+	if s.sel >= len(s.chapters) {
+		s.sel = len(s.chapters) - 1
+	}
+	return s.chapters[s.sel]
 }
 
-// totals across everything, for the progress bar
-func (s *studyState) totals() (chaptersDone, chapters, checksDone, checks int) {
+func (s *studyState) totals() (done, total, answered, questions int) {
 	for _, c := range s.chapters {
-		chapters++
+		total++
 		if c.complete() {
-			chaptersDone++
+			done++
 		}
-		d, t := c.doneCount()
-		checksDone += d
-		checks += t
+		a, t := c.answeredCount()
+		answered += a
+		questions += t
 	}
 	return
 }
@@ -291,119 +389,128 @@ func (m model) updateStudy(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	c := s.current()
 
+	if s.editing {
+		switch msg.String() {
+		case "esc":
+			s.editing = false
+			s.area.Blur()
+			s.msg = "discarded"
+			return m, nil
+		case "ctrl+s":
+			s.editing = false
+			s.area.Blur()
+			if c != nil {
+				c.setAnswer(s.qsel-len(c.checks), s.area.Value())
+				if c.doneAll() {
+					c.setStatus("done")
+					s.msg = "all answered — " + c.title + " done"
+				} else {
+					if c.status == "todo" {
+						c.setStatus("reading")
+					}
+					s.msg = "saved"
+				}
+				if err := c.save(); err != nil {
+					s.msg = "save failed: " + err.Error()
+				}
+			}
+			return m, nil
+		}
+		var cmd tea.Cmd
+		s.area, cmd = s.area.Update(msg)
+		return m, cmd
+	}
+
 	switch msg.String() {
 	case "esc", "q", "ctrl+c":
 		m.mode = modeList
-		s.msg = ""
 		return m, nil
 
-	case "tab":
-		if s.focus == focusChapters && c != nil && len(c.checks) > 0 {
-			s.focus = focusChecks
-			s.checkSel = 0
-		} else {
-			s.focus = focusChapters
+	case "j", "down", "tab":
+		if c != nil && s.qsel < c.items()-1 {
+			s.qsel++
+		}
+		return m, nil
+	case "k", "up", "shift+tab":
+		if s.qsel > 0 {
+			s.qsel--
 		}
 		return m, nil
 
-	case "h", "left":
-		s.focus = focusChapters
+	case "J", "ctrl+n":
+		if s.sel < len(s.chapters)-1 {
+			s.sel++
+			s.qsel = 0
+		}
 		return m, nil
-
-	case "l", "right":
-		if c != nil && len(c.checks) > 0 {
-			s.focus = focusChecks
+	case "K", "ctrl+p":
+		if s.sel > 0 {
+			s.sel--
+			s.qsel = 0
 		}
 		return m, nil
 
-	case "j", "down":
-		if s.focus == focusChapters {
-			if s.sel < len(s.shown)-1 {
-				s.sel++
-				s.checkSel = 0
-			}
-		} else if c != nil && s.checkSel < len(c.checks)-1 {
-			s.checkSel++
-		}
-		return m, nil
-
-	case "k", "up":
-		if s.focus == focusChapters {
-			if s.sel > 0 {
-				s.sel--
-				s.checkSel = 0
-			}
-		} else if s.checkSel > 0 {
-			s.checkSel--
-		}
-		return m, nil
-
-	case "g":
-		if s.focus == focusChapters {
-			s.sel, s.checkSel = 0, 0
-		} else {
-			s.checkSel = 0
-		}
-		return m, nil
-
-	case "G":
-		if s.focus == focusChapters {
-			s.sel = maxi(0, len(s.shown)-1)
-		} else if c != nil {
-			s.checkSel = maxi(0, len(c.checks)-1)
-		}
-		return m, nil
-
-	case " ", "x", "enter":
-		// tick the check under the cursor, or the first unticked one
-		if c == nil || len(c.checks) == 0 {
+	case " ", "x":
+		// a check: one keystroke, no markdown
+		if c == nil || s.qsel >= len(c.checks) {
 			return m, nil
 		}
-		i := s.checkSel
-		if s.focus == focusChapters {
-			i = -1
-			for j, k := range c.checks {
-				if !k.done {
-					i = j
-					break
-				}
-			}
-			if i < 0 {
-				i = 0
-			}
-		}
-		c.toggle(i)
-		// ticking the last check finishes the chapter, which is the rule the
-		// documents themselves state: a chapter is done when its checks pass
-		if d, t := c.doneCount(); t > 0 && d == t && c.status != "done" {
-			c.cycleStatusTo("done")
-			s.msg = c.title + " — all checks pass, marked done"
+		c.toggle(s.qsel)
+		if c.doneAll() {
+			c.setStatus("done")
+			s.msg = c.title + " — everything done"
 		} else if c.status == "todo" {
-			c.cycleStatusTo("reading")
+			c.setStatus("reading")
+			s.msg = "ticked"
+		} else {
+			s.msg = "ticked"
 		}
 		if err := c.save(); err != nil {
 			s.msg = "save failed: " + err.Error()
-		} else if s.msg == "" {
-			s.msg = "saved"
 		}
 		return m, nil
 
-	case "s":
-		if c != nil {
-			c.cycleStatus(1)
-			if err := c.save(); err != nil {
-				s.msg = "save failed: " + err.Error()
-			} else {
-				s.msg = c.title + " → " + c.status
+	case "enter", "a":
+		if c == nil {
+			return m, nil
+		}
+		if s.qsel < len(c.checks) { // enter on a check ticks it too
+			return m.updateStudy(tea.KeyMsg{Type: tea.KeySpace})
+		}
+		qi := s.qsel - len(c.checks)
+		if qi >= len(c.quest) {
+			return m, nil
+		}
+		s.editing = true
+		s.area.SetValue(c.quest[qi].answer)
+		s.area.Focus()
+		s.msg = ""
+		return m, textarea.Blink
+
+	case "d":
+		if c != nil && c.diagram != "" {
+			if ds := newDiagramState(c.diagram); ds != nil {
+				m.diagram = ds
+				return m, nil
 			}
+			s.msg = "no diagram called " + c.diagram
+		} else if c != nil {
+			s.msg = "this lesson has no diagram"
 		}
 		return m, nil
 
-	case "S":
+	case "P":
+		// park a lesson you have decided not to do now. Everything else about
+		// status is derived from the work, so there is nothing else to set.
 		if c != nil {
-			c.cycleStatus(-1)
+			if c.status == "parked" {
+				c.setStatus("todo")
+				s.msg = c.title + " — back on the list"
+			} else {
+				c.setStatus("parked")
+				s.msg = c.title + " — parked"
+			}
 			c.save()
-			s.msg = c.title + " → " + c.status
 		}
 		return m, nil
 
@@ -414,36 +521,29 @@ func (m model) updateStudy(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "p":
-		if c != nil && c.source != "" {
-			p := filepath.Join(vaultDir(), c.source)
-			return m, runExec("pdf", "zathura "+shellQuote(p))
+		// a source is a PDF in the vault or a URL. zathura on a URL prints
+		// "could not open document", which reads like a broken file rather
+		// than the wrong tool.
+		if c == nil || c.source == "" {
+			s.msg = "no source recorded in the frontmatter"
+			return m, nil
 		}
-		s.msg = "no source PDF recorded in the frontmatter"
-		return m, nil
+		if strings.HasPrefix(c.source, "http://") || strings.HasPrefix(c.source, "https://") {
+			return m, runExec("source", "w3m "+shellQuote(c.source))
+		}
+		p := filepath.Join(vaultDir(), c.source)
+		if _, err := os.Stat(p); err != nil {
+			s.msg = "source not on disk: " + c.source
+			return m, nil
+		}
+		return m, runExec("pdf", "zathura "+shellQuote(p))
 
 	case "r":
 		m.study = newStudyState()
-		m.study.msg = "reloaded from disk"
-		return m, nil
-
-	case "/":
-		m.studyFiltering = true
-		m.mode = modeFilter
-		m.filter.SetValue(s.filter)
-		m.filter.Focus()
+		m.study.msg = "reloaded"
 		return m, nil
 	}
 	return m, nil
-}
-
-func (c *chapter) cycleStatusTo(want string) {
-	for c.status != want {
-		before := c.status
-		c.cycleStatus(1)
-		if c.status == before {
-			return
-		}
-	}
 }
 
 func editorCmd() string {
@@ -460,31 +560,34 @@ func shellQuote(s string) string {
 // ---------------------------------------------------------------- view
 
 func bar(done, total, width int) string {
-	if total == 0 {
-		return cFant.Render(strings.Repeat("─", width))
+	if total == 0 || width <= 0 {
+		return cFant.Render(strings.Repeat("─", maxi(0, width)))
 	}
 	filled := done * width / total
-	var b strings.Builder
-	for i := 0; i < width; i++ {
-		if i < filled {
-			b.WriteString(cCool.Render("█"))
-		} else {
-			b.WriteString(cFant.Render("░"))
-		}
-	}
-	return b.String()
+	return cCool.Render(strings.Repeat("█", filled)) +
+		cFant.Render(strings.Repeat("░", width-filled))
 }
 
-func statusStyle(st string) lipgloss.Style {
-	switch st {
-	case "done":
-		return cCool
-	case "reading":
-		return cWarn
-	case "parked":
-		return cFant
+// clip forces a block to exactly n lines of at most w visible cells. This is
+// the whole fix for the jumping frame: nothing downstream may grow.
+//
+// Note it does NOT use truncate(): these lines are already styled, and
+// truncate counts runes. Escape sequences are runes, so it would cut inside
+// one and leave the line as three visible characters and a broken colour.
+func clip(lines []string, n, w int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		if i >= len(lines) {
+			out = append(out, "")
+			continue
+		}
+		l := lines[i]
+		if lipgloss.Width(l) > w {
+			l = decor.Take(l, w, lipgloss.Width) + "\x1b[0m"
+		}
+		out = append(out, l)
 	}
-	return cDim
+	return out
 }
 
 func (m model) viewStudy() string {
@@ -492,38 +595,36 @@ func (m model) viewStudy() string {
 	if s == nil {
 		return ""
 	}
-	w := m.w
-	if w <= 0 {
-		w = 80
-	}
-	listW := 34
+	w := m.contentWidth()
+	listW := 30
 	if w < 90 {
-		listW = 26
+		listW = 22
 	}
-	detailW := w - listW - 10
-	if detailW < 24 {
-		detailW = 24
+	mainW := w - listW - 8
+	if mainW < 30 {
+		mainW = 30
 	}
-	rows := m.h - 12
+	if m.prefs.ReadWidth > 0 && m.prefs.ReadWidth < mainW {
+		mainW = m.prefs.ReadWidth
+	}
+	rows := m.h - 8
 	if rows < 6 {
 		rows = 6
 	}
 
-	cd, ct, kd, kt := s.totals()
+	cd, ct, qa, qt := s.totals()
 	head := " " + gradient("▌ S T U D Y", true) + "  " +
-		cDim.Render(fmt.Sprintf("%d/%d chapters   %d/%d checks", cd, ct, kd, kt)) +
-		"\n " + bar(kd, kt, mini(w-4, 60))
+		cDim.Render(fmt.Sprintf("%d/%d lessons · %d/%d answers", cd, ct, qa, qt)) +
+		"\n " + bar(qa, qt, mini(w-4, 56))
 
-	// ---- left: chapters
-	var left strings.Builder
-	left.WriteString(paneTitle("chapters", listW, s.focus == focusChapters) + "\n")
-	start, end := window(s.sel, len(s.shown), rows-2)
-	lastDoc := ""
-	for i := start; i < end; i++ {
-		c := s.chapters[s.shown[i]]
-		if c.doc != lastDoc {
-			left.WriteString(cPurp.Render(truncate("▌ "+c.doc, listW)) + "\n")
-			lastDoc = c.doc
+	// ---- left: where you are
+	var left []string
+	selRow := 0
+	lastCourse := ""
+	for i, c := range s.chapters {
+		if c.course != lastCourse {
+			left = append(left, cPurp.Render(truncate("▌ "+c.course, listW)))
+			lastCourse = c.course
 		}
 		mark := "○"
 		if c.complete() {
@@ -531,101 +632,129 @@ func (m model) viewStudy() string {
 		} else if c.status == "reading" {
 			mark = "◐"
 		}
-		d, t := c.doneCount()
+		a, at := c.answeredCount()
+		k, kt := c.checkCount()
 		tail := ""
-		if t > 0 {
-			tail = fmt.Sprintf(" %d/%d", d, t)
+		if at+kt > 0 {
+			tail = fmt.Sprintf(" %d/%d", a+k, at+kt)
 		}
-		label := fmt.Sprintf("%s %s", mark, truncate(c.title, listW-6-len(tail)))
-		line := pad(label+tail, listW)
-		if i == s.sel && s.focus == focusChapters {
-			left.WriteString(selOn.Render(line))
-		} else if i == s.sel {
-			left.WriteString(selOff.Render(line))
+		line := pad(truncate(mark+" "+c.title, listW-len(tail)-1)+tail, listW)
+		if i == s.sel {
+			selRow = len(left)
+			left = append(left, selOn.Render(line))
 		} else {
-			left.WriteString(statusStyle(c.status).Render(line))
+			left = append(left, cDim.Render(line))
 		}
-		left.WriteString("\n")
 	}
+	lstart, _ := window(selRow, len(left), rows-2)
+	left = clip(left[mini(lstart, len(left)):], rows-2, listW)
 
-	// ---- right: the chapter itself
-	var right strings.Builder
+	// ---- centre: the lesson
 	c := s.current()
+	var main []string
+	qRow := 0
 	if c == nil {
-		right.WriteString(cDim.Render("no chapters found in " + learnDir()))
+		main = []string{cDim.Render("no lessons in " + learnDir())}
 	} else {
-		right.WriteString(paneTitle(c.title, detailW, s.focus == focusChecks) + "\n")
-		right.WriteString(cDim.Render(pad(fmt.Sprintf("%s · ch %d · priority %d · ",
-			c.doc, c.num, c.priority), detailW-8)))
-		right.WriteString(statusStyle(c.status).Render(c.status) + "\n\n")
+		main = append(main, cCool.Bold(true).Render(truncate(c.title, mainW)))
+		main = append(main, cFant.Render(strings.Repeat("─", mainW)))
+		for _, p := range c.prose {
+			for _, ln := range wrap(p, mainW) {
+				main = append(main, cBase.Render(ln))
+			}
+			main = append(main, "")
+		}
+		if c.diagram != "" {
+			main = append(main, cWarn.Render("◈ press d — interactive diagram: "+c.diagram))
+			main = append(main, "")
+		}
 
 		if len(c.checks) > 0 {
-			right.WriteString(cPurp.Render("CHECK IT YOURSELF") + "\n")
-			right.WriteString(cFant.Render("done when these pass, not when it is read") + "\n\n")
-			for i, k := range c.checks {
-				box := cFant.Render("[ ]")
+			main = append(main, cPurp.Render("DO THESE"))
+			main = append(main, "")
+		}
+		for i, k := range c.checks {
+			if i == s.qsel {
+				qRow = len(main)
+			}
+			box := cFant.Render("[ ]")
+			if k.done {
+				box = cCool.Render("[x]")
+			}
+			for j, ln := range wrap(k.text, mainW-5) {
+				prefix := "    "
+				if j == 0 {
+					prefix = box + " "
+				}
+				st := cBase
 				if k.done {
-					box = cCool.Render("[x]")
+					st = cDim
 				}
-				body := wrap(k.text, detailW-6)
-				for j, ln := range body {
-					prefix := "    "
-					if j == 0 {
-						prefix = box + " "
-					}
-					style := cBase
-					if k.done {
-						style = cDim
-					}
-					if i == s.checkSel && s.focus == focusChecks {
-						style = cCool.Bold(true)
-					}
-					right.WriteString(prefix + style.Render(ln) + "\n")
+				if i == s.qsel {
+					st = cCool.Bold(true)
 				}
+				main = append(main, prefix+st.Render(ln))
 			}
-			right.WriteString("\n")
+			main = append(main, "")
 		}
 
-		if len(c.gotcha) > 0 {
-			right.WriteString(cWarn.Render("THE GOTCHA") + "\n")
-			for _, g := range c.gotcha {
-				if strings.TrimSpace(g) == "" {
-					continue
-				}
-				for _, ln := range wrap(g, detailW-2) {
-					right.WriteString(cWarn.Render(ln) + "\n")
-				}
-			}
-			right.WriteString("\n")
+		if len(c.quest) > 0 {
+			main = append(main, cPurp.Render("ANSWER THESE"))
+			main = append(main, "")
 		}
-
-		if len(c.notes) > 0 {
-			right.WriteString(cPurp.Render("YOUR NOTES") + "\n")
-			for _, n := range c.notes {
-				for _, ln := range wrap(n, detailW-2) {
-					right.WriteString(cBase.Render(ln) + "\n")
+		if c.items() == 0 {
+			main = append(main, cDim.Render("nothing to do in this lesson yet"))
+		}
+		for i, q := range c.quest {
+			if len(c.checks)+i == s.qsel {
+				qRow = len(main)
+			}
+			mark := cFant.Render("○")
+			if q.answered() {
+				mark = cCool.Render("●")
+			}
+			num := fmt.Sprintf("%d. ", i+1)
+			for j, ln := range wrap(q.text, mainW-5) {
+				prefix := "   "
+				if j == 0 {
+					prefix = mark + " " + num
+				}
+				st := cBase
+				if len(c.checks)+i == s.qsel {
+					st = cCool.Bold(true)
+				}
+				main = append(main, prefix+st.Render(ln))
+			}
+			if len(c.checks)+i == s.qsel && s.editing {
+				for _, ln := range strings.Split(s.area.View(), "\n") {
+					main = append(main, "    "+ln)
+				}
+			} else if q.answered() {
+				for _, ln := range wrap(q.answer, mainW-6) {
+					main = append(main, "     "+cDim.Render(ln))
 				}
 			}
+			main = append(main, "")
 		}
 	}
+	mstart, _ := window(qRow, len(main), rows-2)
+	main = clip(main[mini(mstart, len(main)):], rows-2, mainW)
 
-	leftPane, rightPane := paneOff, paneOn
-	if s.focus == focusChapters {
-		leftPane, rightPane = paneOn, paneOff
-	}
 	body := lipgloss.JoinHorizontal(lipgloss.Top,
-		leftPane.Height(rows).Width(listW+2).Render(left.String()),
-		rightPane.Height(rows).Width(detailW+2).Render(right.String()),
+		paneOff.Height(rows).Width(listW+2).Render(strings.Join(left, "\n")),
+		paneOn.Height(rows).Width(mainW+2).Render(strings.Join(main, "\n")),
 	)
 
+	keys := "space tick  ↵ answer  jk item  JK lesson  d diagram  p source  e edit  P park  q back"
+	if s.editing {
+		keys = "ctrl+s save    esc discard"
+	}
 	status := stTag.Render("STUDY") +
 		stMid.Width(maxi(4, w-14)).Render(truncate(
-			s.msg+"   "+cDim.Render("space tick  s status  e note  p pdf  / filter  r reload  q back"),
-			maxi(4, w-18)))
+			s.msg+"   "+cDim.Render(keys), maxi(4, w-18)))
 	return head + "\n" + body + "\n" + status
 }
 
-// wrap breaks text at word boundaries to a column width.
 func wrap(s string, width int) []string {
 	if width < 8 {
 		width = 8

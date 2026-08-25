@@ -64,8 +64,54 @@ func ArtDir() string {
 
 type Art struct {
 	Name   string
-	Lines  []string
-	Colour bool // true for .ans — it carries its own escape codes
+	Lines  []string   // frame 0, kept for callers that do not animate
+	Frames [][]string // one entry per frame; length 1 for a still
+	Colour bool       // true for .ans — it carries its own escape codes
+}
+
+// Animated reports whether this piece has more than one frame.
+func (a Art) Animated() bool { return len(a.Frames) > 1 }
+
+// Frame returns frame n, wrapping. Safe on a still.
+func (a Art) Frame(n int) []string {
+	if len(a.Frames) == 0 {
+		return a.Lines
+	}
+	if n < 0 {
+		n = -n
+	}
+	return a.Frames[n%len(a.Frames)]
+}
+
+// splitFrames divides a file into frames. Two conventions are accepted, both
+// of which are what ASCII animation collections actually use in the wild:
+// a form feed (0x0C) between frames, or a line containing only "---".
+func splitFrames(lines []string) [][]string {
+	var frames [][]string
+	cur := []string{}
+	flush := func() {
+		for len(cur) > 0 && strings.TrimSpace(cur[len(cur)-1]) == "" {
+			cur = cur[:len(cur)-1]
+		}
+		if len(cur) > 0 {
+			frames = append(frames, cur)
+		}
+		cur = []string{}
+	}
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "---" || strings.Contains(l, "\f") {
+			// a form feed may sit at the end of a content line
+			if idx := strings.Index(l, "\f"); idx > 0 {
+				cur = append(cur, l[:idx])
+			}
+			flush()
+			continue
+		}
+		cur = append(cur, l)
+	}
+	flush()
+	return frames
 }
 
 // LoadArt reads every decorative file, skipping anything too large to be
@@ -89,27 +135,32 @@ func LoadArt(maxW, maxH int) []Art {
 		if err != nil {
 			continue
 		}
-		lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
-		// trim trailing blank lines so the box hugs the art
-		for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
-			lines = lines[:len(lines)-1]
-		}
-		if len(lines) == 0 || len(lines) > maxH {
+		raw := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+		frames := splitFrames(raw)
+		if len(frames) == 0 {
 			continue
 		}
-		too := false
-		for _, l := range lines {
-			if len(l) > maxW*4 { // generous: escapes inflate byte length
-				too = true
+		// every frame must be small enough to be decoration
+		bad := false
+		for _, fr := range frames {
+			if len(fr) > maxH {
+				bad = true
 				break
 			}
+			for _, l := range fr {
+				if len(l) > maxW*4 { // generous: escapes inflate byte length
+					bad = true
+					break
+				}
+			}
 		}
-		if too {
+		if bad {
 			continue
 		}
 		out = append(out, Art{
 			Name:   strings.TrimSuffix(e.Name(), ext),
-			Lines:  lines,
+			Lines:  frames[0],
+			Frames: frames,
 			Colour: ext == ".ans",
 		})
 	}
@@ -145,22 +196,46 @@ func Overlay(bg, fg []string, x, y int, width func(string) int) []string {
 	return out
 }
 
-// spliceLine puts src into dst starting at column x. It works on rendered
-// strings containing escape sequences, so it cannot index by byte: it walks
-// dst until it has consumed x visible cells, then emits src and skips the
-// cells src covers.
+// spliceLine puts src into dst starting at column x.
+//
+// The subtlety that produced a real bug: dst is rendered as ONE styled
+// string, with its escape sequence at position 0. Cutting into the middle
+// and keeping only the remainder throws that escape away, so the tail
+// inherits whatever colour src last set — the backdrop came back green.
+// dropCells therefore returns the styles that were in force at the cut, and
+// they are re-emitted before the tail. src is fenced with resets so its own
+// styling cannot leak either way.
 func spliceLine(dst, src string, x int, width func(string) int) string {
 	if x <= 0 && width(src) >= width(dst) {
 		return src
 	}
 	head := takeCells(dst, x, width)
 	srcW := width(src)
-	tail := dropCells(dst, x+srcW, width)
+	styles, tail := dropCells(dst, x+srcW, width)
+
 	pad := x - width(head)
 	if pad < 0 {
 		pad = 0
 	}
-	return head + strings.Repeat(" ", pad) + src + tail
+	var b strings.Builder
+	b.WriteString(head)
+	if pad > 0 {
+		b.WriteString(strings.Repeat(" ", pad))
+	}
+	b.WriteString("\x1b[0m")
+	b.WriteString(src)
+	b.WriteString("\x1b[0m")
+	b.WriteString(styles) // restore the backdrop's own styling
+	b.WriteString(tail)
+	return b.String()
+}
+
+// Take is takeCells, exported: the prefix of s covering n visible cells with
+// escape sequences preserved. Callers need this because a styled string
+// cannot be truncated by rune count — the escape bytes are runes too, so a
+// naive cut lands inside a sequence and shreds both the text and the colour.
+func Take(s string, n int, width func(string) int) string {
+	return takeCells(s, n, width)
 }
 
 // takeCells returns the prefix of s covering n visible cells, keeping any
@@ -196,9 +271,11 @@ func takeCells(s string, n int, width func(string) int) string {
 	return b.String()
 }
 
-// dropCells returns the remainder of s after n visible cells.
-func dropCells(s string, n int, width func(string) int) string {
-	var b strings.Builder
+// dropCells returns two things: every escape sequence that was in force
+// before the cut, and the remainder of s after n visible cells. The caller
+// needs the first to re-establish styling on the second.
+func dropCells(s string, n int, width func(string) int) (styles, rest string) {
+	var pre, out strings.Builder
 	used := 0
 	r := []rune(s)
 	i := 0
@@ -211,17 +288,20 @@ func dropCells(s string, n int, width func(string) int) string {
 			if i < len(r) {
 				i++
 			}
+			seq := string(r[start:i])
 			if used >= n {
-				b.WriteString(string(r[start:i]))
+				out.WriteString(seq)
+			} else {
+				pre.WriteString(seq)
 			}
 			continue
 		}
 		w := width(string(r[i]))
 		if used >= n {
-			b.WriteRune(r[i])
+			out.WriteRune(r[i])
 		}
 		used += w
 		i++
 	}
-	return b.String()
+	return pre.String(), out.String()
 }

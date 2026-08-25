@@ -54,6 +54,42 @@ type Cmd struct {
 // decorMargin is how many columns of backdrop show either side.
 const decorMargin = 4
 
+// sidebarWidth is how much room the animated widget gets. Zero on a narrow
+// terminal: the interface always wins over the decoration.
+// contentWidth is how many columns the interface itself may use: the
+// terminal, less the backdrop margins, less the sidebar. Every mode must
+// derive from this — computing width from m.w directly is what made the
+// widget overlap the study pane.
+func (m model) contentWidth() int {
+	w := m.w - 2*decorMargin - m.sidebarW()
+	if w < 40 {
+		w = 40
+	}
+	return w
+}
+
+// sidebarW is the live width, honouring the preference.
+func (m model) sidebarW() int {
+	if !m.prefs.Widget {
+		return 0
+	}
+	return sidebarWidth(m.w)
+}
+
+func sidebarWidth(w int) int {
+	switch {
+	case w >= 150:
+		return 40
+	case w >= 120:
+		return 30
+	case w >= 104:
+		return 22
+	}
+	return 0
+}
+
+func decorLoad() []decor.Art { return decor.LoadArt(60, 14) }
+
 const genPrefix = "@gen"
 
 func isGen(run string) bool {
@@ -576,12 +612,22 @@ func gradient(s string, bold bool) string {
 
 // customBanner is resolved ONCE, at startup. Resolving it per frame meant a
 // complete shell startup per rendered keystroke.
+// customBanner renders the header once, at startup. Two sources, in order:
+// a TheDraw font named in banner.conf, or SB_BANNER shelling out for anyone
+// who wants something else. The font path is preferred because its gaps are
+// painted; raw command output is not, so the backdrop shows through it.
 func customBanner() string {
-	c := os.Getenv("SB_BANNER")
-	if c == "" {
+	c := loadBannerConf()
+	if f := findFont(c.font); f != nil {
+		if lines := bannerLines(f, c.text); len(lines) > 0 {
+			return strings.Join(lines, "\n")
+		}
+	}
+	cmd := os.Getenv("SB_BANNER")
+	if cmd == "" {
 		return ""
 	}
-	out, err := capture(c, 3*time.Second)
+	out, err := capture(cmd, 3*time.Second)
 	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
 		return ""
 	}
@@ -622,6 +668,7 @@ const (
 	modeConfirmDelete
 	modeGen
 	modeStudy
+	modeFonts
 )
 
 type focus int
@@ -667,10 +714,18 @@ type model struct {
 	genLoad bool
 	spin    spinner.Model
 	art     []decor.Art
+	frame   int
+	widget  int     // which one this session got
+	prefs   prefs
+	prefSel int
+	prefOpen bool
+	clock   float64 // seconds since start, drives every animation
 
 	// study mode: a reader/tracker over the vault's markdown notes
 	study          *studyState
-	studyFiltering bool
+	diagram        *diagramState
+	fonts          *fontState
+	fontsEditing   bool
 }
 
 func newInput(placeholder, prompt string, limit int) textinput.Model {
@@ -692,7 +747,15 @@ func initialModel() model {
 	if err != nil {
 		m.status = "could not read config: " + err.Error()
 	}
-	m.art = decor.LoadArt(60, 14)
+	m.prefs = loadPrefs()
+	m.prefs.applyFontSize()
+	m.art = decorLoad()
+	// a different widget on every launch, seeded by the clock
+	if m.prefs.WidgetPick >= 0 {
+		m.widget = m.prefs.WidgetPick % totalWidgets()
+	} else {
+		m.widget = int(time.Now().UnixNano()/1e6) % totalWidgets()
+	}
 	m.spin = spinner.New()
 	m.spin.Spinner = spinner.Dot
 	m.filter = newInput("filter", "  / ", 40)
@@ -813,7 +876,28 @@ func mini(a, b int) int {
 	return b
 }
 
-func (m model) Init() tea.Cmd { return textinput.Blink }
+// decorTick drives ASCII animation in the margin. Slow on purpose: this is
+// decoration, and a fast repaint of the whole canvas is not free.
+type decorTickMsg struct{}
+
+func decorTick() tea.Cmd {
+	return tea.Tick(180*time.Millisecond, func(time.Time) tea.Msg {
+		return decorTickMsg{}
+	})
+}
+
+func (m model) hasAnimation() bool {
+	for _, a := range m.art {
+		if a.Animated() {
+			return true
+		}
+	}
+	return false
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(textinput.Blink, decorTick())
+}
 
 // ---------------------------------------------------------------- update
 
@@ -824,7 +908,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.w, m.h = msg.Width, msg.Height
 		return m, nil
 
+	case fontsLoadedMsg:
+		if m.fonts != nil {
+			m.fonts.loading = false
+			if msg.err != nil {
+				m.fonts.err = msg.err.Error()
+			} else {
+				m.fonts.all = msg.entries
+				m.fonts.refilter("")
+			}
+		}
+		return m, nil
+
+	case decorTickMsg:
+		m.frame++
+		m.clock += 0.18 * m.prefs.WidgetSpeed
+		return m, decorTick()
+
 	case spinner.TickMsg:
+		if m.fonts != nil && m.fonts.loading {
+			var cmd tea.Cmd
+			m.spin, cmd = m.spin.Update(msg)
+			return m, cmd
+		}
 		if !m.genLoad {
 			return m, nil
 		}
@@ -863,6 +969,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// preferences float over whatever mode is underneath, so they are
+		// handled before the mode switch rather than inside every mode
+		if m.diagram != nil {
+			switch msg.String() {
+			case "esc", "q", "d", "ctrl+c":
+				m.diagram = nil
+			case "h", "left":
+				m.diagram.adjust(-1)
+			case "l", "right":
+				m.diagram.adjust(+1)
+			case "j", "down":
+				m.diagram.sel = mini(len(m.diagram.d.Params)-1, m.diagram.sel+1)
+			case "k", "up":
+				m.diagram.sel = maxi(0, m.diagram.sel-1)
+			}
+			return m, nil
+		}
+		if m.prefOpen {
+			return m.updatePrefs(msg)
+		}
+		switch msg.String() {
+		case ",":
+			m.prefOpen = true
+			return m, nil
+		case "ctrl+w":
+			m.prefs.Widget = !m.prefs.Widget
+			m.prefs.save()
+			return m, nil
+		case "ctrl+n":
+			m.widget = (m.widget + 1) % totalWidgets()
+			m.prefs.WidgetPick = m.widget
+			m.prefs.save()
+			return m, nil
+		}
 		switch m.mode {
 		case modeFilter:
 			return m.updateFilter(msg)
@@ -874,6 +1014,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateGen(msg)
 		case modeStudy:
 			return m.updateStudy(msg)
+		case modeFonts:
+			return m.updateFonts(msg)
 		default:
 			return m.updateList(msg)
 		}
@@ -888,11 +1030,9 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterText = ""
 		m.filter.SetValue("")
 		m.filter.Blur()
-		if m.study != nil && m.studyFiltering {
-			m.study.filter = ""
-			m.study.refilter()
-			m.studyFiltering = false
-			m.mode = modeStudy
+		if m.fontsEditing {
+			m.fontsEditing = false
+			m.mode = modeFonts
 			return m, nil
 		}
 		m.mode = modeList
@@ -905,11 +1045,11 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		m.filter.Blur()
-		if m.study != nil && m.studyFiltering {
-			m.study.filter = m.filterText
-			m.study.refilter()
-			m.studyFiltering = false
-			m.mode = modeStudy
+		if m.fontsEditing && m.fonts != nil {
+			m.fonts.text = m.filter.Value()
+			m.fonts.refilter("")
+			m.fontsEditing = false
+			m.mode = modeFonts
 			return m, nil
 		}
 		m.mode = modeList
@@ -923,11 +1063,6 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.filter, cmd = m.filter.Update(msg)
 	m.filterText = m.filter.Value()
-	if m.study != nil && m.studyFiltering {
-		m.study.filter = m.filterText
-		m.study.refilter()
-		return m, cmd
-	}
 	if len(m.stack) > 0 {
 		m.regenFilter()
 	} else {
@@ -1040,9 +1175,20 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			curTheme = (curTheme - 1 + len(themes)) % len(themes)
 		}
 		applyTheme(themes[curTheme])
+		m.bannerTxt = customBanner()
 		m.filter.PromptStyle = fg(themes[curTheme].Hot)
 		saveTheme(themes[curTheme].Name)
 		m.status = "theme: " + themes[curTheme].Name
+		return m, nil
+
+	case "F":
+		if m.fonts == nil {
+			m.fonts = newFontState()
+			m.mode = modeFonts
+			m.spin.Style = cCool
+			return m, tea.Batch(loadFonts(), m.spin.Tick)
+		}
+		m.mode = modeFonts
 		return m, nil
 
 	case "S":
@@ -1251,7 +1397,7 @@ func (m model) canvas(content string) string {
 			cw = x
 		}
 	}
-	x := (w - cw) / 2
+	x := (w - m.sidebarW() - cw) / 2
 	if x < 0 {
 		x = 0
 	}
@@ -1261,19 +1407,31 @@ func (m model) canvas(content string) string {
 	}
 	out := decor.Overlay(bg, lines, x, y, lipgloss.Width)
 
+	// the animated widget lives in the right-hand sidebar, if there is one
+	if sw := m.sidebarW(); sw > 8 {
+		sh := h - 2
+		if sh > 4 {
+			lines, name := sidebarFrame(m.widget%totalWidgets(),
+				sw, sh, m.frame, m.clock*m.prefs.WidgetScale, p.Bg)
+			lines = append(lines, cDim.Render(pad(" "+name, sw)))
+			out = decor.Overlay(out, lines, w-sw-1, 1, lipgloss.Width)
+		}
+	}
+
 	// a piece of art from ~/.config/switchboard/decor/, bottom-left of the
 	// margin if it fits. Purely optional: no files, nothing drawn.
 	if a := decor.PickArt(m.art, curTheme); a != nil {
+		frame := a.Frame(m.frame)
 		aw := 0
-		for _, l := range a.Lines {
+		for _, l := range frame {
 			if v := lipgloss.Width(l); v > aw {
 				aw = v
 			}
 		}
-		ay := h - len(a.Lines) - 1
+		ay := h - len(frame) - 1
 		if aw <= x-2 && ay > y {
-			art := make([]string, len(a.Lines))
-			for i, l := range a.Lines {
+			art := make([]string, len(frame))
+			for i, l := range frame {
 				if a.Colour {
 					art[i] = l
 				} else {
@@ -1290,25 +1448,62 @@ func (m model) View() string {
 	if m.quitting {
 		return ""
 	}
+	if m.diagram != nil {
+		return m.canvas(overlayModal(m.baseView(), m.viewDiagram()))
+	}
+	if m.prefOpen {
+		return m.canvas(overlayModal(m.baseView(), m.viewPrefs()))
+	}
+	return m.canvas(m.baseView())
+}
+
+func (m model) baseView() string {
 	switch m.mode {
 	case modeAdd:
-		return m.canvas(m.viewAdd())
+		return m.viewAdd()
 	case modeConfirmDelete:
-		return m.canvas(m.viewConfirm())
+		return m.viewConfirm()
 	case modeStudy:
-		return m.canvas(m.viewStudy())
+		return m.viewStudy()
+	case modeFonts:
+		return m.viewFonts()
 	}
-	return m.canvas(m.viewMain())
+	return m.viewMain()
+}
+
+func (m model) updatePrefs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", ",", "ctrl+c":
+		m.prefOpen = false
+		m.prefs.save()
+		m.prefs.applyFontSize()
+		if m.prefs.WidgetPick >= 0 {
+			m.widget = m.prefs.WidgetPick % totalWidgets()
+		}
+		return m, nil
+	case "j", "down":
+		m.prefSel = mini(len(prefRows)-1, m.prefSel+1)
+	case "k", "up":
+		m.prefSel = maxi(0, m.prefSel-1)
+	case "h", "left":
+		prefRows[m.prefSel].dec(&m.prefs)
+	case "l", "right", " ", "enter":
+		prefRows[m.prefSel].inc(&m.prefs)
+	case "r":
+		m.prefs = defaultPrefs()
+	}
+	m.prefs.applyFontSize()
+	if m.prefs.WidgetPick >= 0 {
+		m.widget = m.prefs.WidgetPick % totalWidgets()
+	}
+	return m, nil
 }
 
 // geometry derives every dimension from the terminal size, so nothing is
 // hardcoded and the layout degrades instead of breaking.
 func (m model) geometry() (railW, itemW, rows int) {
 	// inset so the backdrop pattern shows as a margin on all sides
-	w := m.w - 2*decorMargin
-	if w < 40 {
-		w = 40
-	}
+	w := m.contentWidth()
 	railW = 14
 	if w < 64 {
 		railW = 10
@@ -1495,62 +1690,59 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 	return b.String()
 }
 
-// renderDetail is the pane underneath: exactly what will run, and the note.
+// renderDetail is the strip under the panes. It is a FIXED three lines —
+// letting it grow with its content is what made the frame jitter as the
+// selection moved between entries with and without notes.
+//
+// It also no longer shows the command. sb exists so you do not have to know
+// the command; printing it back was using the most valuable line on screen to
+// tell you the one thing the program is for hiding.
 func (m model) renderDetail(w int) string {
 	inner := w - 4
-	var lines []string
+	line1, line2 := "", ""
 
 	if m.mode == modeGen || (m.mode == modeFilter && len(m.stack) > 0) {
 		lv := m.top()
-		if lv == nil || len(lv.shown) == 0 {
-			lines = append(lines, cDim.Render("—"))
-		} else {
-			line := lv.items[lv.shown[lv.cursor]]
+		if lv != nil && len(lv.shown) > 0 {
+			line1 = cBase.Render(truncate(lv.items[lv.shown[lv.cursor]], inner))
 			if isGen(lv.tmpl) {
-				inList, _ := genParts(lv.tmpl)
-				lines = append(lines, cPurp.Render("list ")+
-					cBase.Render(truncate(substitute(inList, line, lv.parent), inner-6)))
+				line2 = cPurp.Render("› opens another list")
 			} else {
-				r := substitute(lv.tmpl, line, lv.parent)
-				if isExec(r) {
-					lines = append(lines, cCool.Render("↺ ")+
-						cBase.Render(truncate(execBody(r), inner-3)),
-						cDim.Render("runs here, returns to sb when you quit it"))
-				} else {
-					lines = append(lines, cCool.Render("$ ")+
-						cBase.Render(truncate(r, inner-3)))
-				}
+				line2 = cDim.Render("↵ runs this")
 			}
 		}
 	} else if c, ok := m.current(); ok {
-		if isGen(c.Run) {
-			list, tmpl := genParts(c.Run)
-			lines = append(lines,
-				cPurp.Render("list ")+cBase.Render(truncate(list, inner-6)),
-				cPurp.Render("run  ")+cBase.Render(truncate(tmpl, inner-6)))
-		} else if isExec(c.Run) {
-			lines = append(lines, cCool.Render("↺ ")+
-				cBase.Render(truncate(execBody(c.Run), inner-3)),
-				cDim.Render("runs here, returns to sb when you quit it"))
-		} else {
-			lines = append(lines, cCool.Render("$ ")+cBase.Render(truncate(c.Run, inner-3)))
+		line1 = cCool.Render(c.Name) + cDim.Render("  "+truncate(c.Desc, inner-len(c.Name)-3))
+		switch {
+		case c.Note != "":
+			line2 = cWarn.Render(truncate(c.Note, inner))
+		case isGen(c.Run):
+			line2 = cPurp.Render("› opens a list")
+		case isExec(c.Run):
+			line2 = cDim.Render("↺ runs here, returns to sb")
+		default:
+			line2 = cDim.Render("↵ hands off to the shell")
 		}
-		if c.Note != "" {
-			lines = append(lines, cWarn.Render(truncate(c.Note, inner)))
-		}
-	} else {
-		lines = append(lines, cDim.Render("—"))
 	}
 	if m.status != "" {
-		lines = append(lines, cWarn.Render(truncate(m.status, inner)))
+		line2 = cWarn.Render(truncate(m.status, inner))
 	}
-	return paneOff.Width(w - 2).Render(strings.Join(lines, "\n"))
+	return paneOff.Width(inner).Height(2).Render(
+		truncateCells(line1, inner) + "\n" + truncateCells(line2, inner))
+}
+
+// truncateCells cuts a styled string by visible cells, not runes.
+func truncateCells(s string, n int) string {
+	if lipgloss.Width(s) <= n {
+		return s
+	}
+	return decor.Take(s, n, lipgloss.Width) + "\x1b[0m"
 }
 
 // renderStatus is the bar along the bottom, segmented like the lipgloss demo.
 func (m model) renderStatus(w int, inGen bool) string {
 	tag := "SB"
-	keys := "↵ run  tab pane  / filter  S study  t theme  a add  d del  e edit  q quit"
+	keys := "↵ run  / filter  S study  F fonts  , prefs  t theme  a add  d del  e edit  q quit"
 	if inGen {
 		tag = "LIST"
 		keys = "↵ run  h back  / filter  q back"
