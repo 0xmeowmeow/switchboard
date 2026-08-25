@@ -30,6 +30,9 @@ type prefs struct {
 
 	// terminal
 	FontSize int `json:"font_size"` // kitty only; 0 leaves it alone
+
+	// fonts mode
+	ExportDir string `json:"export_dir"` // "" = ~/Pictures/switchboard-fonts
 }
 
 func defaultPrefs() prefs {

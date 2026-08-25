@@ -68,9 +68,11 @@ func (m model) contentWidth() int {
 	return w
 }
 
-// sidebarW is the live width, honouring the preference.
+// sidebarW is the live width, honouring the preference. The fonts browser
+// always gets the full screen — 3722 fonts need every column they can get,
+// and the widget has nothing to do with what you're looking at there.
 func (m model) sidebarW() int {
-	if !m.prefs.Widget {
+	if !m.prefs.Widget || m.mode == modeFonts {
 		return 0
 	}
 	return sidebarWidth(m.w)
@@ -95,6 +97,35 @@ const genPrefix = "@gen"
 func isGen(run string) bool {
 	s := strings.TrimSpace(run)
 	return s == genPrefix || strings.HasPrefix(s, genPrefix+" ")
+}
+
+// "@mode:NAME" switches to a built-in screen instead of running a shell
+// command — how fonts (and, later, anything else internal) gets a normal,
+// findable, describable menu entry instead of a key you have to already
+// know. That's the whole point of switchboard: nothing is invisible.
+const modePrefix = "@mode:"
+
+func modeTarget(run string) (string, bool) {
+	s := strings.TrimSpace(run)
+	if strings.HasPrefix(s, modePrefix) {
+		return strings.TrimSpace(strings.TrimPrefix(s, modePrefix)), true
+	}
+	return "", false
+}
+
+func (m model) enterMode(name string) (tea.Model, tea.Cmd) {
+	switch name {
+	case "fonts":
+		if m.fonts == nil {
+			m.fonts = newFontState()
+			m.mode = modeFonts
+			m.spin.Style = cCool
+			return m, tea.Batch(loadFonts(), m.spin.Tick)
+		}
+		m.mode = modeFonts
+		return m, nil
+	}
+	return m, nil
 }
 
 // genParts splits on the FIRST >>, which is what makes nesting work: the
@@ -457,10 +488,16 @@ func applyTheme(p Palette) {
 	cWarn = fg(p.Warn)
 	cPurp = fg(p.Second)
 
+	// BorderForeground colours the border glyphs; without a matching
+	// BorderBackground lipgloss renders them with NO background at all
+	// (an explicit "reset to default" SGR, not "inherit") — which is how
+	// the terminal's own wallpaper was showing through every box edge.
 	paneOn = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(p.Accent)).Padding(0, 1)
+		BorderForeground(lipgloss.Color(p.Accent)).
+		BorderBackground(lipgloss.Color(p.Bg)).Padding(0, 1)
 	paneOff = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(p.Faint)).Padding(0, 1)
+		BorderForeground(lipgloss.Color(p.Faint)).
+		BorderBackground(lipgloss.Color(p.Bg)).Padding(0, 1)
 
 	selOn = lipgloss.NewStyle().Foreground(lipgloss.Color(p.Dark)).
 		Background(lipgloss.Color(p.Accent)).Bold(true)
@@ -915,6 +952,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.fonts.err = msg.err.Error()
 			} else {
 				m.fonts.all = msg.entries
+				m.fonts.groups = buildGroups(msg.entries)
 				m.fonts.refilter("")
 			}
 		}
@@ -1155,6 +1193,10 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
+		if name, ok := modeTarget(c.Run); ok {
+			m.usage.bump(c)
+			return m.enterMode(name)
+		}
 		if isGen(c.Run) {
 			list, tmpl := genParts(c.Run)
 			m.usage.bump(c)
@@ -1179,16 +1221,6 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filter.PromptStyle = fg(themes[curTheme].Hot)
 		saveTheme(themes[curTheme].Name)
 		m.status = "theme: " + themes[curTheme].Name
-		return m, nil
-
-	case "F":
-		if m.fonts == nil {
-			m.fonts = newFontState()
-			m.mode = modeFonts
-			m.spin.Style = cCool
-			return m, tea.Batch(loadFonts(), m.spin.Tick)
-		}
-		m.mode = modeFonts
 		return m, nil
 
 	case "S":

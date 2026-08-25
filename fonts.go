@@ -4,14 +4,17 @@
 // underneath, updating as you move. 3722 fonts is unbrowsable by scrolling,
 // so the list is always a filtered view and the filters are the interface.
 //
+// A collection routinely ships the same design several times over — an
+// outline, a block and a colour version, or the same shapes in a different
+// DOS palette — under the identical font name. Those collapse into one row
+// here; v/V cycle through the variants without cluttering the list with
+// what is, to the eye, the same font five times.
+//
 // Auto-tags cost nothing — every one is derived from data already parsed
-// while loading, so the browser is useful before you have tagged anything.
-// Hand tags layer on top in ~/.config/tdfbrowse/tags.json and never touch
-// the font files.
+// while loading, so the browser is useful before you have touched anything.
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,7 +48,7 @@ type fontEntry struct {
 // ---------------------------------------------------------------- tagging
 
 // autoTags derive from measurements taken during the load. Free, and enough
-// to make the first run useful.
+// to make the browser useful and searchable with nothing hand-maintained.
 func autoTags(f *tdf.Font, w, h int) []string {
 	var t []string
 	t = append(t, tdf.TypeName(f.Type))
@@ -92,11 +95,6 @@ func autoTags(f *tdf.Font, w, h int) []string {
 	return t
 }
 
-func tagsPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "tdfbrowse", "tags.json")
-}
-
 // ---------------------------------------------------------------- loading
 
 func fontSearchPaths() []string {
@@ -118,11 +116,6 @@ type fontsLoadedMsg struct {
 // second, so it runs as a command rather than blocking the first frame.
 func loadFonts() tea.Cmd {
 	return func() tea.Msg {
-		hand := map[string][]string{}
-		if b, err := os.ReadFile(tagsPath()); err == nil {
-			json.Unmarshal(b, &hand)
-		}
-
 		var out []fontEntry
 		seen := map[string]bool{}
 		for _, dir := range fontSearchPaths() {
@@ -150,7 +143,7 @@ func loadFonts() tea.Cmd {
 					w, h := f.Bounds()
 					key := fmt.Sprintf("%s:%d", base, i)
 					e := fontEntry{file: base, index: i, font: f, w: w, h: h, key: key}
-					e.tags = append(autoTags(f, w, h), hand[key]...)
+					e.tags = autoTags(f, w, h)
 					out = append(out, e)
 				}
 			}
@@ -159,6 +152,8 @@ func loadFonts() tea.Cmd {
 			return fontsLoadedMsg{err: fmt.Errorf("no .tdf files found in %s",
 				strings.Join(fontSearchPaths(), " "))}
 		}
+		// grouping below relies on same-named fonts sitting next to each
+		// other, so name is the primary sort key.
 		sort.SliceStable(out, func(i, j int) bool {
 			a, b := out[i], out[j]
 			if a.font.Name != b.font.Name {
@@ -170,54 +165,54 @@ func loadFonts() tea.Cmd {
 	}
 }
 
+// buildGroups collapses consecutive same-name entries (the sort above puts
+// every variant of a font next to each other) into one row apiece.
+func buildGroups(all []fontEntry) [][]int {
+	var groups [][]int
+	for i := range all {
+		name := strings.ToLower(all[i].font.Name)
+		if n := len(groups); n > 0 {
+			last := groups[n-1]
+			if strings.ToLower(all[last[0]].font.Name) == name {
+				groups[n-1] = append(last, i)
+				continue
+			}
+		}
+		groups = append(groups, []int{i})
+	}
+	return groups
+}
+
 // ---------------------------------------------------------------- state
 
 type fontState struct {
-	all      []fontEntry
-	shown    []int
-	sel      int
-	loading  bool
-	err      string
-	text     string   // what gets rendered in the preview
-	filters  []string // active tag filters, ANDed
-	scrollX  int
-	msg      string
-	tagInput bool
-	editing  bool
-}
+	all     []fontEntry
+	groups  [][]int // each: indices into `all` sharing a font name
+	shown   []int   // indices into `groups`, filtered by query + spellability
+	sel     int
+	variant int // which member of the selected group is being previewed
 
-// facets are the filters offered, in the order they are cycled.
-var facets = []string{
-	"", "colour", "block", "tiny", "small", "medium", "tall",
-	"narrow", "regular", "wide", "full", "partial", "sparse",
-	"mono", "multi", "caps", "digits",
+	loading bool
+	err     string
+	text    string // what gets rendered in the preview
+	scrollX int
+	msg     string
+
+	editing   bool // text-edit modal owns the keyboard
+	exporting bool // export-format modal owns the keyboard
 }
 
 func newFontState() *fontState {
 	return &fontState{loading: true, text: "SWITCHBOARD"}
 }
 
-func (s *fontState) hasTag(e fontEntry, t string) bool {
-	for _, x := range e.tags {
-		if x == t {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *fontState) refilter(query string) {
 	s.shown = s.shown[:0]
 	q := strings.ToLower(query)
-	for i, e := range s.all {
+	for gi, grp := range s.groups {
+		e := s.all[grp[0]]
 		ok := true
-		for _, f := range s.filters {
-			if !s.hasTag(e, f) {
-				ok = false
-				break
-			}
-		}
-		if ok && q != "" {
+		if q != "" {
 			ok = strings.Contains(strings.ToLower(e.font.Name), q) ||
 				strings.Contains(strings.ToLower(e.file), q) ||
 				strings.Contains(strings.ToLower(strings.Join(e.tags, " ")), q)
@@ -235,52 +230,33 @@ func (s *fontState) refilter(query string) {
 			}
 		}
 		if ok {
-			s.shown = append(s.shown, i)
+			s.shown = append(s.shown, gi)
 		}
 	}
 	if s.sel >= len(s.shown) {
 		s.sel = maxi(0, len(s.shown)-1)
 	}
+	s.variant = 0
 }
 
+// current is the specific variant the preview is showing right now.
 func (s *fontState) current() *fontEntry {
 	if len(s.shown) == 0 {
 		return nil
 	}
-	return &s.all[s.shown[s.sel]]
+	grp := s.groups[s.shown[s.sel]]
+	v := s.variant
+	if v >= len(grp) {
+		v = 0
+	}
+	return &s.all[grp[v]]
 }
 
-func (s *fontState) toggleFilter(t string) {
-	if t == "" {
-		s.filters = nil
-		return
+func (s *fontState) selGroup() []int {
+	if len(s.shown) == 0 {
+		return nil
 	}
-	for i, f := range s.filters {
-		if f == t {
-			s.filters = append(s.filters[:i], s.filters[i+1:]...)
-			return
-		}
-	}
-	s.filters = append(s.filters, t)
-}
-
-// saveTag records a hand tag against file:index — never against the filename,
-// because one file can hold sixteen fonts.
-func (s *fontState) saveTag(e *fontEntry, tag string) error {
-	hand := map[string][]string{}
-	if b, err := os.ReadFile(tagsPath()); err == nil {
-		json.Unmarshal(b, &hand)
-	}
-	for _, t := range hand[e.key] {
-		if t == tag {
-			return nil
-		}
-	}
-	hand[e.key] = append(hand[e.key], tag)
-	e.tags = append(e.tags, tag)
-	os.MkdirAll(filepath.Dir(tagsPath()), 0755)
-	b, _ := json.MarshalIndent(hand, "", "  ")
-	return os.WriteFile(tagsPath(), b, 0644)
+	return s.groups[s.shown[s.sel]]
 }
 
 // ---------------------------------------------------------------- render
@@ -288,69 +264,27 @@ func (s *fontState) saveTag(e *fontEntry, tag string) error {
 // renderFont lays glyphs side by side into styled lines. Glyph rows are
 // ragged — TheDraw ends a row rather than padding it — so short rows pad here.
 func renderFont(f *tdf.Font, text string, mono bool) []string {
-	type g struct{ glyph *tdf.Glyph }
-	var gs []g
-	height := 0
-	for _, r := range text {
-		if r == ' ' {
-			gs = append(gs, g{nil})
-			continue
-		}
-		gl := f.Glyph(r)
-		if gl == nil {
-			continue
-		}
-		gs = append(gs, g{gl})
-		if int(gl.Height) > height {
-			height = int(gl.Height)
-		}
-	}
-	if height == 0 {
+	grid := walkGlyphs(f, text)
+	if grid == nil {
 		return []string{"(this font has none of those characters)"}
 	}
-	spacing := int(f.Spacing)
-	if spacing < 1 {
-		spacing = 1
-	}
-
-	out := make([]string, height)
-	for row := 0; row < height; row++ {
+	out := make([]string, len(grid))
+	for row, line := range grid {
 		var b strings.Builder
-		for _, x := range gs {
-			if x.glyph == nil { // a space between words
-				b.WriteString(cCanvas.Render("    "))
+		for _, c := range line {
+			if c.gap || c.ch == 0 {
+				b.WriteString(cCanvas.Render(" "))
 				continue
 			}
-			width := int(x.glyph.Width)
-			var cells []tdf.Cell
-			if row < len(x.glyph.Rows) {
-				cells = x.glyph.Rows[row]
+			ch := string(tdf.Rune(c.ch))
+			if mono || f.Type != tdf.TypeColour {
+				b.WriteString(cCool.Render(ch))
+			} else {
+				st := lipgloss.NewStyle().
+					Foreground(lipgloss.Color(dosPalette[c.fg&0x0F])).
+					Background(lipgloss.Color(dosPalette[c.bg&0x0F]))
+				b.WriteString(st.Render(ch))
 			}
-			for col := 0; col < width; col++ {
-				// A glyph row is ragged — TheDraw ends a row rather than
-				// padding it. An unpainted space here lets the canvas
-				// backdrop show through the middle of a letter, so pad with
-				// the app background instead of a bare " ".
-				if col >= len(cells) {
-					b.WriteString(cCanvas.Render(" "))
-					continue
-				}
-				c := cells[col]
-				if c.Ch == 0 {
-					b.WriteString(cCanvas.Render(" "))
-					continue
-				}
-				ch := string(tdf.Rune(c.Ch))
-				if mono || f.Type != tdf.TypeColour {
-					b.WriteString(cCool.Render(ch))
-				} else {
-					st := lipgloss.NewStyle().
-						Foreground(lipgloss.Color(dosPalette[c.Fg&0x0F])).
-						Background(lipgloss.Color(dosPalette[c.Bg&0x0F]))
-					b.WriteString(st.Render(ch))
-				}
-			}
-			b.WriteString(cCanvas.Render(strings.Repeat(" ", spacing)))
 		}
 		out[row] = b.String()
 	}
@@ -365,9 +299,28 @@ func (m model) updateFonts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeList
 		return m, nil
 	}
-	e := s.current()
 
-	// the modal owns the keyboard while it is open
+	// the export modal owns the keyboard while it is open
+	if s.exporting {
+		switch msg.String() {
+		case "esc":
+			s.exporting = false
+		case "1", "2", "3", "4":
+			formats := map[string]string{"1": "html", "2": "png", "3": "ansi", "4": "txt"}
+			e := s.current()
+			path, err := exportFont(e, s.text, formats[msg.String()], m.prefs)
+			if err != nil {
+				s.msg = "export failed: " + err.Error()
+			} else {
+				copyPath(path)
+				s.msg = "exported → " + path + "  (path copied)"
+			}
+			s.exporting = false
+		}
+		return m, nil
+	}
+
+	// the text-edit modal owns the keyboard while it is open
 	if s.editing {
 		switch msg.String() {
 		case "esc":
@@ -389,31 +342,7 @@ func (m model) updateFonts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// typing a tag takes priority over every other binding
-	if s.tagInput {
-		switch msg.String() {
-		case "esc":
-			s.tagInput = false
-			s.msg = ""
-		case "enter":
-			s.tagInput = false
-			t := strings.TrimSpace(strings.ToLower(m.filter.Value()))
-			if t != "" && e != nil {
-				if err := s.saveTag(e, t); err != nil {
-					s.msg = "tag failed: " + err.Error()
-				} else {
-					s.msg = "tagged " + e.font.Name + " " + t
-				}
-			}
-			m.filter.SetValue("")
-			m.filter.Blur()
-		default:
-			var cmd tea.Cmd
-			m.filter, cmd = m.filter.Update(msg)
-			return m, cmd
-		}
-		return m, nil
-	}
+	e := s.current()
 
 	switch msg.String() {
 	case "esc", "q", "ctrl+c":
@@ -423,26 +352,41 @@ func (m model) updateFonts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "j", "down":
 		if s.sel < len(s.shown)-1 {
 			s.sel++
-			s.scrollX = 0
+			s.scrollX, s.variant = 0, 0
 		}
 		return m, nil
 	case "k", "up":
 		if s.sel > 0 {
 			s.sel--
-			s.scrollX = 0
+			s.scrollX, s.variant = 0, 0
 		}
 		return m, nil
 	case "ctrl+d":
 		s.sel = mini(len(s.shown)-1, s.sel+10)
+		s.variant = 0
 		return m, nil
 	case "ctrl+u":
 		s.sel = maxi(0, s.sel-10)
+		s.variant = 0
 		return m, nil
 	case "g":
-		s.sel, s.scrollX = 0, 0
+		s.sel, s.scrollX, s.variant = 0, 0, 0
 		return m, nil
 	case "G":
 		s.sel = maxi(0, len(s.shown)-1)
+		s.variant = 0
+		return m, nil
+
+	// cycle the variants a row collapsed — same name, different type/palette
+	case "v":
+		if grp := s.selGroup(); len(grp) > 1 {
+			s.variant = (s.variant + 1) % len(grp)
+		}
+		return m, nil
+	case "V":
+		if grp := s.selGroup(); len(grp) > 1 {
+			s.variant = (s.variant - 1 + len(grp)) % len(grp)
+		}
 		return m, nil
 
 	// the preview is wider than any terminal — 30 columns per glyph
@@ -456,48 +400,16 @@ func (m model) updateFonts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.scrollX = 0
 		return m, nil
 
-	case "f":
-		// cycle the facet filter forward
-		next := facets[0]
-		if len(s.filters) > 0 {
-			for i, f := range facets {
-				if f == s.filters[len(s.filters)-1] {
-					next = facets[(i+1)%len(facets)]
-				}
-			}
-			s.filters = s.filters[:len(s.filters)-1]
-		} else {
-			next = facets[1]
-		}
-		s.toggleFilter(next)
-		s.refilter(s.msgQuery())
-		return m, nil
-
-	case "F":
-		s.filters = nil
-		s.refilter(s.msgQuery())
-		s.msg = "filters cleared"
-		return m, nil
-
-	case "t":
-		if e != nil {
-			s.tagInput = true
-			m.filter.SetValue("")
-			m.filter.Focus()
-			s.msg = "tag: "
-		}
-		return m, nil
-
 	case "e":
 		s.editing = true
-		s.tagInput = false
 		m.filter.SetValue(s.text)
 		m.filter.Focus()
 		return m, nil
 
-	case "y":
+	case "x":
 		if e != nil {
-			s.msg = fmt.Sprintf("tdf -f %s -i %d '%s'", e.file, e.index, s.text)
+			s.exporting = true
+			s.msg = ""
 		}
 		return m, nil
 
@@ -507,8 +419,6 @@ func (m model) updateFonts(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
-
-func (s *fontState) msgQuery() string { return "" }
 
 // ---------------------------------------------------------------- view
 
@@ -532,10 +442,7 @@ func (m model) viewFonts() string {
 		return head + "\n\n " + cWarn.Render(s.err) + "\n"
 	}
 
-	head += cDim.Render(fmt.Sprintf("%d of %d", len(s.shown), len(s.all)))
-	if len(s.filters) > 0 {
-		head += "  " + cPurp.Render(strings.Join(s.filters, "+"))
-	}
+	head += cDim.Render(fmt.Sprintf("%d of %d", len(s.shown), len(s.groups)))
 
 	// ---- top pane: the list
 	listRows := (h - 14) / 2
@@ -545,15 +452,20 @@ func (m model) viewFonts() string {
 	var list strings.Builder
 	list.WriteString(paneTitle("fonts", w-4, true) + "\n")
 	if len(s.shown) == 0 {
-		list.WriteString(cDim.Render("nothing matches — F clears the filters"))
+		list.WriteString(cDim.Render("nothing matches — e changes the preview text"))
 	}
 	start, end := window(s.sel, len(s.shown), listRows)
 	for i := start; i < end; i++ {
-		e := s.all[s.shown[i]]
+		grp := s.groups[s.shown[i]]
+		e := s.all[grp[0]]
+		variants := ""
+		if len(grp) > 1 {
+			variants = fmt.Sprintf("×%d", len(grp))
+		}
 		tags := strings.Join(pickTags(e.tags, 4), " ")
-		line := fmt.Sprintf(" %-16s %-15s %2dx%-2d %3d/94  %s",
+		line := fmt.Sprintf(" %-16s %-15s %2dx%-2d %3d/94 %-3s %s",
 			truncate(e.font.Name, 16), truncate(e.file, 15),
-			e.w, e.h, e.font.Count(), tags)
+			e.w, e.h, e.font.Count(), variants, tags)
 		line = pad(truncate(line, w-6), w-6)
 		if i == s.sel {
 			list.WriteString(selOn.Render(line))
@@ -570,6 +482,9 @@ func (m model) viewFonts() string {
 	if e != nil {
 		title = fmt.Sprintf("%s · %s #%d · %s",
 			e.font.Name, e.file, e.index, tdf.TypeName(e.font.Type))
+		if grp := s.selGroup(); len(grp) > 1 {
+			title += fmt.Sprintf("  (variant %d/%d — v/V)", s.variant+1, len(grp))
+		}
 	}
 	prev.WriteString(paneTitle(title, w-4, false) + "\n")
 	if e != nil {
@@ -585,10 +500,7 @@ func (m model) viewFonts() string {
 	)
 
 	foot := " " + cBase.Render("text: ") + cCool.Render(s.text)
-	if s.tagInput {
-		foot = m.filter.View()
-	}
-	keys := "jk move  hl scroll  e text  f filter  F clear  t tag  y copy cmd  q back"
+	keys := "jk move  v variant  hl scroll  e text  x export  q back"
 	status := stTag.Render("FONTS") +
 		stMid.Width(maxi(4, w-14)).Render(truncate(s.msg+"   "+cDim.Render(keys), maxi(4, w-18)))
 	view := head + "\n" + body + "\n" + foot + "\n" + status
@@ -599,6 +511,13 @@ func (m model) viewFonts() string {
 			m.filter.View(),
 			"↵ apply    esc cancel    only fonts that can spell it are listed",
 			mini(56, w-8)))
+	}
+	if s.exporting {
+		view = overlayModal(view, modalBox(
+			"EXPORT",
+			"1 html    2 png    3 ansi (.ans)    4 txt",
+			"→ "+exportDir(m.prefs)+"    esc cancel",
+			mini(60, w-8)))
 	}
 	return view
 }
@@ -667,6 +586,7 @@ func modalBox(title, body, help string, w int) string {
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(themes[curTheme].Second)).
+		BorderBackground(lipgloss.Color(themes[curTheme].Bg)).
 		Background(lipgloss.Color(themes[curTheme].Bg)).
 		Padding(1, 2).Width(w).Render(inner)
 }
