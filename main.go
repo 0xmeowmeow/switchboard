@@ -933,7 +933,7 @@ func (m model) hasAnimation() bool {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, decorTick())
+	return tea.Batch(textinput.Blink, decorTick(), syncApps())
 }
 
 // ---------------------------------------------------------------- update
@@ -943,6 +943,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		return m, nil
+
+	case appsAddedMsg:
+		switch {
+		case msg.err != nil:
+			m.status = "apps sync: " + msg.err.Error()
+		case len(msg.names) > 0:
+			cmds, err := loadCommands(m.usage)
+			if err == nil {
+				m.cmds = cmds
+				m.rebuildGroups()
+				m.rebuildItems()
+			}
+			plural := ""
+			if len(msg.names) != 1 {
+				plural = "s"
+			}
+			m.status = fmt.Sprintf("+%d new app%s: %s", len(msg.names), plural, strings.Join(msg.names, ", "))
+		}
 		return m, nil
 
 	case fontsLoadedMsg:
