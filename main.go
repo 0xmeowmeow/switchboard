@@ -834,6 +834,12 @@ func (m *model) matches(c Cmd) bool {
 		strings.Contains(strings.ToLower(c.Note), q)
 }
 
+// rebuildItems always resets itemIdx to the top. It used to only clamp when
+// the new count made the old index out of range — which meant that as long
+// as the number stayed in bounds, filtering, adding, deleting, or the apps
+// auto-sync would silently leave the cursor pointing at whatever unrelated
+// item now sat at that position, instead of the item you were looking at.
+// A position that stayed numerically valid is not the same item.
 func (m *model) rebuildItems() {
 	g := m.groups[m.groupIdx]
 	m.items = m.items[:0]
@@ -842,9 +848,7 @@ func (m *model) rebuildItems() {
 			m.items = append(m.items, i)
 		}
 	}
-	if m.itemIdx >= len(m.items) {
-		m.itemIdx = maxi(0, len(m.items)-1)
-	}
+	m.itemIdx = 0
 }
 
 func (m *model) current() (Cmd, bool) {
@@ -1099,6 +1103,9 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.stack) > 0 {
 			m.mode = modeGen
 			m.regenFilter()
+			if lv := m.top(); lv != nil {
+				lv.cursor = 0
+			}
 		} else {
 			m.rebuildItems()
 		}
@@ -1125,6 +1132,9 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.filterText = m.filter.Value()
 	if len(m.stack) > 0 {
 		m.regenFilter()
+		if lv := m.top(); lv != nil {
+			lv.cursor = 0
+		}
 	} else {
 		m.rebuildItems()
 	}

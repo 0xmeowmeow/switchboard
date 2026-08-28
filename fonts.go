@@ -233,9 +233,10 @@ func (s *fontState) refilter(query string) {
 			s.shown = append(s.shown, gi)
 		}
 	}
-	if s.sel >= len(s.shown) {
-		s.sel = maxi(0, len(s.shown)-1)
-	}
+	// always to the top: a position that's still numerically valid after
+	// the query changes is not necessarily still the same font (see the
+	// identical fix to the main list's rebuildItems for the full story).
+	s.sel = 0
 	s.variant = 0
 }
 
