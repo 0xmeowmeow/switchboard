@@ -763,6 +763,8 @@ type model struct {
 	diagram        *diagramState
 	fonts          *fontState
 	fontsEditing   bool
+
+	watched map[string]bool // "<level title>/<line>" -> seen, in any generator
 }
 
 func newInput(placeholder, prompt string, limit int) textinput.Model {
@@ -787,6 +789,7 @@ func initialModel() model {
 	m.prefs = loadPrefs()
 	m.prefs.applyFontSize()
 	m.art = decorLoad()
+	m.watched = loadWatched()
 	// a different widget on every launch, seeded by the clock
 	if m.prefs.WidgetPick >= 0 {
 		m.widget = m.prefs.WidgetPick % totalWidgets()
@@ -1301,6 +1304,11 @@ func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			lv.cursor = maxi(0, len(lv.shown)-1)
 		}
 		return m, nil
+	case "w":
+		if lv != nil && len(lv.shown) > 0 {
+			m.toggleWatched(lv.title, lv.items[lv.shown[lv.cursor]])
+		}
+		return m, nil
 	case "enter", "l", "right":
 		if lv == nil || len(lv.shown) == 0 {
 			return m, nil
@@ -1678,14 +1686,22 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 		start, end := window(lv.cursor, len(lv.shown), rows-2)
 		for i := start; i < end; i++ {
 			line := lv.items[lv.shown[i]]
+			watched := m.watched[watchedKey(lv.title, line)]
 			mark := " "
 			if nested {
 				mark = "›"
 			}
-			text := pad(truncate(line, w-2), w-2) + " "
-			if i == lv.cursor {
+			check := "  "
+			if watched {
+				check = "✓ "
+			}
+			text := check + pad(truncate(line, w-4), w-4) + " "
+			switch {
+			case i == lv.cursor:
 				b.WriteString(selOn.Render(" "+text) + cPurp.Render(mark))
-			} else {
+			case watched:
+				b.WriteString(" " + cFant.Render(text) + cFant.Render(mark))
+			default:
 				b.WriteString(" " + cBase.Render(text) + cFant.Render(mark))
 			}
 			b.WriteString("\n")
@@ -1796,7 +1812,7 @@ func (m model) renderStatus(w int, inGen bool) string {
 	keys := "↵ run  / filter  S study  F fonts  , prefs  t theme  a add  d del  e edit  q quit"
 	if inGen {
 		tag = "LIST"
-		keys = "↵ run  h back  / filter  q back"
+		keys = "↵ run  w watched  h back  / filter  q back"
 	}
 	mid := "—"
 	if inGen {
