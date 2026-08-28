@@ -1531,6 +1531,7 @@ func (m model) baseView() string {
 }
 
 func (m model) updatePrefs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	beforeSize := m.prefs.FontSize
 	switch msg.String() {
 	case "esc", "q", ",", "ctrl+c":
 		m.prefOpen = false
@@ -1551,7 +1552,13 @@ func (m model) updatePrefs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.prefs = defaultPrefs()
 	}
-	m.prefs.applyFontSize()
+	// only actually ask kitty to resize when FontSize itself changed —
+	// this used to fire on every keypress in this screen, including plain
+	// j/k navigation and edits to unrelated rows, each one reflowing the
+	// whole terminal grid for nothing.
+	if m.prefs.FontSize != beforeSize {
+		m.prefs.applyFontSize()
+	}
 	if m.prefs.WidgetPick >= 0 {
 		m.widget = m.prefs.WidgetPick % totalWidgets()
 	}
