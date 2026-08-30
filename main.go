@@ -734,7 +734,6 @@ const (
 	modeBluetooth
 	modeNetwork
 	modePulsar
-	modeHome // the tile grid; the top level, set explicitly in initialModel
 )
 
 type focus int
@@ -837,13 +836,7 @@ func initialModel() model {
 		m.addBuf[i] = newInput(labels[i], fmt.Sprintf("  %-16s ", labels[i]+":"), 200)
 	}
 	m.rebuildGroups()
-	// land the tile cursor on the hottest real group ("all" is index 0), so
-	// the home screen opens pointing at what gets used most.
-	if len(m.groups) > 1 {
-		m.groupIdx = 1
-	}
 	m.rebuildItems()
-	m.mode = modeHome
 	return m
 }
 
@@ -1190,8 +1183,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch m.mode {
-		case modeHome:
-			return m.updateHome(msg)
 		case modeFilter:
 			return m.updateFilter(msg)
 		case modeAdd:
@@ -1273,14 +1264,9 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+c":
+	case "ctrl+c", "q", "esc":
 		m.quitting = true
 		return m, tea.Quit
-
-	case "q", "esc":
-		m.mode = modeHome // the list sits under the tile grid now
-		m.status = ""
-		return m, nil
 
 	case "/":
 		m.mode = modeFilter
@@ -1293,11 +1279,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "h", "left":
-		if m.focus == focusItems {
-			m.focus = focusGroups
-			return m, nil
-		}
-		m.mode = modeHome // already on the rail — step back to the tiles
+		m.focus = focusGroups
 		return m, nil
 
 	case "l", "right":
@@ -1672,8 +1654,6 @@ func (m model) View() string {
 
 func (m model) baseView() string {
 	switch m.mode {
-	case modeHome:
-		return m.viewHome()
 	case modeAdd:
 		return m.viewAdd()
 	case modeConfirmDelete:
@@ -2003,7 +1983,7 @@ func truncateCells(s string, n int) string {
 // renderStatus is the bar along the bottom, segmented like the lipgloss demo.
 func (m model) renderStatus(w int, inGen bool) string {
 	tag := "SB"
-	keys := "↵ run  / filter  S study  F fonts  , prefs  t theme  a add  d del  e edit  q home"
+	keys := "↵ run  / filter  S study  F fonts  , prefs  t theme  a add  d del  e edit  q quit"
 	if inGen {
 		tag = "LIST"
 		keys = "↵ run  w watched  h back  / filter  q back"
