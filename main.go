@@ -124,6 +124,31 @@ func (m model) enterMode(name string) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeFonts
 		return m, nil
+	case "bluetooth":
+		if m.bt != nil {
+			m.bt.stop() // always fresh — a stale session isn't worth reusing
+		}
+		s, cmd := startBluetoothctl()
+		m.bt = s
+		m.mode = modeBluetooth
+		return m, cmd
+	case "network", "wifi":
+		if m.net != nil {
+			m.net.stop()
+		}
+		s, cmd := startNmMonitor()
+		m.net = s
+		m.mode = modeNetwork
+		return m, cmd
+	case "pulsar":
+		if m.pulsar != nil { // already running — just return to it
+			m.mode = modePulsar
+			return m, nil
+		}
+		s := newPulsarState(m.w, m.h)
+		m.pulsar = s
+		m.mode = modePulsar
+		return m, s.startCmds()
 	}
 	return m, nil
 }
@@ -706,6 +731,9 @@ const (
 	modeGen
 	modeStudy
 	modeFonts
+	modeBluetooth
+	modeNetwork
+	modePulsar
 )
 
 type focus int
@@ -765,6 +793,9 @@ type model struct {
 	fontsEditing   bool
 
 	watched map[string]bool // "<level title>/<line>" -> seen, in any generator
+	bt      *btState
+	net     *netState
+	pulsar  *pulsarState
 }
 
 func newInput(placeholder, prompt string, limit int) textinput.Model {
@@ -952,6 +983,90 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.w, m.h = msg.Width, msg.Height
 		return m, nil
 
+	case btLineMsg:
+		if m.bt != nil {
+			m.bt.applyLine(string(msg))
+			return m, btReadLine(m.bt.lines)
+		}
+		return m, nil
+
+	case btEOFMsg:
+		if m.bt != nil {
+			m.bt.msg = "bluetoothctl exited"
+		}
+		return m, nil
+
+	case nmLineMsg:
+		if m.net != nil {
+			return m, tea.Batch(nmReadLine(m.net.lines), nmPoll())
+		}
+		return m, nil
+
+	case nmEOFMsg:
+		if m.net != nil {
+			m.net.msg = "nmcli monitor exited"
+		}
+		return m, nil
+
+	case nmPolledMsg:
+		if m.net != nil {
+			m.net.nets = msg.nets
+			m.net.radioOn = msg.radioOn
+			m.net.noDev = msg.noDev
+			if m.net.sel >= len(msg.nets) {
+				m.net.sel = maxi(0, len(msg.nets)-1)
+			}
+		}
+		return m, nil
+
+	case nmActionMsg:
+		if m.net != nil {
+			if msg.err != nil {
+				m.net.msg = msg.summary + ": " + msg.err.Error()
+			} else {
+				m.net.msg = msg.summary + " ✓"
+			}
+		}
+		return m, nil
+
+	case pulsarCavaMsg:
+		if m.pulsar != nil {
+			m.pulsar.eng.ingestCava([]float64(msg))
+			return m, pulsarReadCava(m.pulsar.cavaCh)
+		}
+		return m, nil
+
+	case pulsarPCMMsg:
+		if m.pulsar != nil {
+			m.pulsar.eng.ingestPCM([]float32(msg))
+			return m, pulsarReadPCM(m.pulsar.pcmCh)
+		}
+		return m, nil
+
+	case pulsarEOFMsg:
+		if m.pulsar != nil && msg.src == "cava" {
+			m.pulsar.noCava = true
+			m.pulsar.msg = "cava stopped — check the audio source"
+		}
+		return m, nil
+
+	case pulsarTickMsg:
+		if m.pulsar == nil {
+			return m, nil
+		}
+		p := m.pulsar
+		now := time.Time(msg)
+		dt := 1.0 / float64(p.work.fps())
+		if !p.last.IsZero() {
+			if d := now.Sub(p.last).Seconds(); d > 0 && d < 0.5 {
+				dt = d
+			}
+		}
+		p.last = now
+		p.eng.resize(m.w, maxi(4, m.h-1))
+		p.eng.step(dt)
+		return m, pulsarTick(p.work.fps())
+
 	case appsAddedMsg:
 		switch {
 		case msg.err != nil:
@@ -1080,6 +1195,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateStudy(msg)
 		case modeFonts:
 			return m.updateFonts(msg)
+		case modeBluetooth:
+			return m.updateBluetooth(msg)
+		case modeNetwork:
+			return m.updateNetwork(msg)
+		case modePulsar:
+			return m.updatePulsar(msg)
 		default:
 			return m.updateList(msg)
 		}
@@ -1517,6 +1638,11 @@ func (m model) View() string {
 	if m.quitting {
 		return ""
 	}
+	// pulsar paints the whole terminal itself — skip the backdrop canvas so the
+	// visualiser is full-bleed and never centred or tiled.
+	if m.mode == modePulsar && m.pulsar != nil {
+		return m.viewPulsar()
+	}
 	if m.diagram != nil {
 		return m.canvas(overlayModal(m.baseView(), m.viewDiagram()))
 	}
@@ -1536,6 +1662,12 @@ func (m model) baseView() string {
 		return m.viewStudy()
 	case modeFonts:
 		return m.viewFonts()
+	case modeBluetooth:
+		return m.viewBluetooth()
+	case modeNetwork:
+		return m.viewNetwork()
+	case modePulsar:
+		return m.viewPulsar()
 	}
 	return m.viewMain()
 }
