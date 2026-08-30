@@ -10,6 +10,7 @@ import (
 // a given size, otherwise the frame "jumps" a line as the cursor moves.
 func TestNoFrameJump(t *testing.T) {
 	m := initialModel()
+	m.mode = modeList // this test is about the two-pane browser, not the tile home
 
 	for _, size := range [][2]int{{120, 30}, {160, 40}, {200, 50}, {140, 24}, {100, 28}, {90, 20}, {240, 60}} {
 		m.w, m.h = size[0], size[1]
