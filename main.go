@@ -1774,15 +1774,24 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 	return b.String()
 }
 
-// renderDetail is the strip under the panes. It is a FIXED three lines —
-// letting it grow with its content is what made the frame jitter as the
-// selection moved between entries with and without notes.
+// renderDetail is the strip under the panes. It is a FIXED four lines (two
+// text rows inside a border) — letting it grow with its content is what made
+// the frame jitter as the selection moved between entries with and without
+// notes.
+//
+// The subtle part: paneOff has Padding(0,1), so lipgloss word-wraps the body
+// at Width-2, not Width. Truncating the text to `inner` therefore still left a
+// two-cell overhang that wrapped onto a third row for any long description or
+// note — which is exactly why the whole screen jumped a line when the cursor
+// landed on entries like "ai/chat" or "music/cmus". Truncate to the real wrap
+// width (`tw`) and cap the box height so it can never happen again.
 //
 // It also no longer shows the command. sb exists so you do not have to know
 // the command; printing it back was using the most valuable line on screen to
 // tell you the one thing the program is for hiding.
 func (m model) renderDetail(w int) string {
 	inner := w - 4
+	tw := inner - 2 // paneOff padding; lipgloss wraps the body here
 	line1, line2 := "", ""
 
 	if m.mode == modeGen || (m.mode == modeFilter && len(m.stack) > 0) {
@@ -1811,8 +1820,8 @@ func (m model) renderDetail(w int) string {
 	if m.status != "" {
 		line2 = cWarn.Render(truncate(m.status, inner))
 	}
-	return paneOff.Width(inner).Height(2).Render(
-		truncateCells(line1, inner) + "\n" + truncateCells(line2, inner))
+	return paneOff.Width(inner).Height(2).MaxHeight(4).Render(
+		truncateCells(line1, tw) + "\n" + truncateCells(line2, tw))
 }
 
 // truncateCells cuts a styled string by visible cells, not runes.
