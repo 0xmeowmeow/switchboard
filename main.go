@@ -1740,6 +1740,17 @@ func window(cursor, n, visible int) (start, end int) {
 	return start, end
 }
 
+// clampLines caps s to at most n lines. lipgloss .Height(n) pads a shorter
+// block up to n but leaves a taller one alone, so panes that share a row must
+// be clamped to the same line count or they render at different heights.
+func clampLines(s string, n int) string {
+	ls := strings.Split(s, "\n")
+	if len(ls) > n {
+		ls = ls[:n]
+	}
+	return strings.Join(ls, "\n")
+}
+
 func (m model) viewMain() string {
 	railW, itemW, rows := m.geometry()
 	inGen := m.mode == modeGen || (m.mode == modeFilter && len(m.stack) > 0)
@@ -1758,9 +1769,15 @@ func (m model) viewMain() string {
 		rail, items = paneOn, paneOff
 	}
 
+	// clampLines is essential here, not defensive: lipgloss .Height() only pads,
+	// never truncates, so if renderItems/renderRail ever emit more than `rows`
+	// lines (a full item list is 2 title lines + rows-2 items + a trailing "\n",
+	// i.e. one over) that pane renders taller than its sibling, the body grows a
+	// line, and canvas() flips its top offset — the frame "jump" when you land on
+	// a group that fills the pane.
 	body := lipgloss.JoinHorizontal(lipgloss.Top,
-		rail.Height(rows).Render(m.renderRail(railW, rows, inGen)),
-		items.Height(rows).Render(m.renderItems(itemW, rows, inGen)),
+		rail.Height(rows).Render(clampLines(m.renderRail(railW, rows, inGen), rows)),
+		items.Height(rows).Render(clampLines(m.renderItems(itemW, rows, inGen), rows)),
 	)
 
 	totalW := railW + itemW + 8
@@ -1907,16 +1924,15 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 }
 
 // renderDetail is the strip under the panes. It is a FIXED four lines (two
-// text rows inside a border) — letting it grow with its content is what made
-// the frame jitter as the selection moved between entries with and without
-// notes.
+// text rows inside a border) and must stay that way: anything here that grows
+// with the selected entry re-introduces a frame jitter.
 //
-// The subtle part: paneOff has Padding(0,1), so lipgloss word-wraps the body
-// at Width-2, not Width. Truncating the text to `inner` therefore still left a
-// two-cell overhang that wrapped onto a third row for any long description or
-// note — which is exactly why the whole screen jumped a line when the cursor
-// landed on entries like "ai/chat" or "music/cmus". Truncate to the real wrap
-// width (`tw`) and cap the box height so it can never happen again.
+// paneOff has Padding(0,1), so lipgloss word-wraps the body at Width-2, not
+// Width. Truncating the text to `inner` still left a two-cell overhang that
+// could wrap onto a third row for a long description or note; truncate to the
+// real wrap width (`tw`) and cap the box with MaxHeight(4) so it can't. (The
+// group-browser "jump" itself was a separate bug — a pane height mismatch in
+// viewMain, see clampLines.)
 //
 // It also no longer shows the command. sb exists so you do not have to know
 // the command; printing it back was using the most valuable line on screen to
