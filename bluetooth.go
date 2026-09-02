@@ -27,6 +27,7 @@ type btDevice struct {
 type btState struct {
 	devices  []btDevice
 	sel      int // index into visible(), not devices
+	winStart int // see window() — persists so scrolling doesn't shift the frame
 	scanning bool
 	msg      string
 	pairing  string // mac currently being paired, "" if none in flight
@@ -400,7 +401,7 @@ func (m model) viewBluetooth() string {
 	if rows < 3 {
 		rows = 3
 	}
-	start, end := window(s.sel, len(vis), rows)
+	start, end := window(s.sel, len(vis), rows, &s.winStart)
 	for i := start; i < end; i++ {
 		d := s.devices[vis[i]]
 		status := cFant.Render("○ not paired")

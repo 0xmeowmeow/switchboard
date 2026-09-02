@@ -759,12 +759,14 @@ type model struct {
 	cmds  []Cmd
 	usage usageMap
 
-	groups     []string // "all" first, then real groups in usage order
-	groupIdx   int
-	items      []int // indices into cmds, for the current group + filter
-	itemIdx    int
-	focus      focus
-	filterText string
+	groups        []string // "all" first, then real groups in usage order
+	groupIdx      int
+	groupWinStart int // see window() — persists so scrolling doesn't shift the frame
+	items         []int // indices into cmds, for the current group + filter
+	itemIdx       int
+	itemWinStart  int
+	focus         focus
+	filterText    string
 
 	mode      mode
 	filter    textinput.Model
@@ -793,10 +795,11 @@ type model struct {
 	fonts          *fontState
 	fontsEditing   bool
 
-	watched map[string]bool // "<level title>/<line>" -> seen, in any generator
-	bt      *btState
-	net     *netState
-	pulsar  *pulsarState
+	watched    map[string]bool   // "<level title>/<line>" -> seen, in any generator
+	lastOpened map[string]string // level title -> last line actually run there
+	bt         *btState
+	net        *netState
+	pulsar     *pulsarState
 }
 
 func newInput(placeholder, prompt string, limit int) textinput.Model {
@@ -822,6 +825,7 @@ func initialModel() model {
 	m.prefs.applyFontSize()
 	m.art = decorLoad()
 	m.watched = loadWatched()
+	m.lastOpened = loadLastOpened()
 	// a different widget on every launch, seeded by the clock
 	if m.prefs.WidgetPick >= 0 {
 		m.widget = m.prefs.WidgetPick % totalWidgets()
@@ -881,6 +885,17 @@ func (m *model) rebuildItems() {
 		}
 	}
 	m.itemIdx = 0
+	m.itemWinStart = 0
+}
+
+// syncWindows keeps both panes' scroll offsets minimal and stable after a
+// cursor move — see window()'s own comment for the reasoning. This has to
+// happen here, in Update, not in render: View() only returns a string, so
+// any state it mutated would be discarded before the next frame.
+func (m *model) syncWindows() {
+	_, _, rows := m.geometry()
+	window(m.groupIdx, len(m.groups), rows-2, &m.groupWinStart)
+	window(m.itemIdx, len(m.items), rows-2, &m.itemWinStart)
 }
 
 func (m *model) current() (Cmd, bool) {
@@ -962,6 +977,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		m.syncWindows()
 		if len(m.stack) > 0 {
 			_, itemW, rows := m.geometry()
 			for i := range m.stack {
@@ -1161,6 +1177,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		lv.list = newGenList(lv.items, lv.title, m.watched, isGen(lv.tmpl))
 		_, itemW, rows := m.geometry()
 		lv.list.SetSize(itemW, maxi(1, rows-2))
+		// pick up where you left off: land one row past whatever was last
+		// opened under this exact title (a show's episode list, say),
+		// rather than always starting back at the top.
+		if idx, ok := resumeIndex(lv.items, lv.title, m.lastOpened); ok {
+			lv.list.Select(idx)
+		}
 		if len(lv.items) == 0 {
 			name := lv.title
 			m.pop()
@@ -1309,6 +1331,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else if m.itemIdx > 0 {
 			m.itemIdx--
 		}
+		m.syncWindows()
 		return m, nil
 
 	case "j", "down":
@@ -1321,6 +1344,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else if m.itemIdx < len(m.items)-1 {
 			m.itemIdx++
 		}
+		m.syncWindows()
 		return m, nil
 
 	case "g", "home":
@@ -1330,6 +1354,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.itemIdx = 0
 		}
+		m.syncWindows()
 		return m, nil
 
 	case "G", "end":
@@ -1340,6 +1365,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.itemIdx = maxi(0, len(m.items)-1)
 		}
+		m.syncWindows()
 		return m, nil
 
 	case "enter":
@@ -1449,6 +1475,7 @@ func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		resolved := substitute(lv.tmpl, line, lv.parent)
+		m.markOpened(lv.title, line)
 		if isExec(resolved) {
 			return m, runExec(truncate(line, 40), execBody(resolved))
 		}
@@ -1732,12 +1759,32 @@ func (m model) geometry() (railW, itemW, rows int) {
 	return railW, itemW, rows
 }
 
-func window(cursor, n, visible int) (start, end int) {
-	if cursor >= visible {
-		start = cursor - visible + 1
+// window computes which of n items are visible around cursor, in a
+// `visible`-row frame whose top row is *start — and *start is the whole
+// point: it persists across calls (each caller keeps it in their own state,
+// e.g. m.itemWinStart), so the frame only scrolls the minimum needed to keep
+// cursor on screen, exactly like a normal pager or file browser. Recomputing
+// start fresh from cursor alone, as this used to, pins cursor to the LAST
+// visible row forever once you scroll past the first page — every "up" then
+// has to shift the whole window down by one to compensate, so a long list
+// never lets you just move the highlight within what's already on screen.
+func window(cursor, n, visible int, start *int) (int, int) {
+	if visible <= 0 {
+		return 0, 0
 	}
-	end = mini(n, start+visible)
-	return start, end
+	switch {
+	case cursor < *start:
+		*start = cursor
+	case cursor >= *start+visible:
+		*start = cursor - visible + 1
+	}
+	if lastStart := n - visible; *start > lastStart {
+		*start = maxi(0, lastStart)
+	}
+	if *start < 0 {
+		*start = 0
+	}
+	return *start, mini(n, *start+visible)
 }
 
 // clampLines caps s to at most n lines. lipgloss .Height(n) pads a shorter
@@ -1809,7 +1856,7 @@ func (m model) renderRail(w, rows int, inGen bool) string {
 
 	focused := m.focus == focusGroups
 	b.WriteString(paneTitle("groups", w, focused) + "\n")
-	start, end := window(m.groupIdx, len(m.groups), rows-2)
+	start, end := window(m.groupIdx, len(m.groups), rows-2, &m.groupWinStart)
 	for i := start; i < end; i++ {
 		g := m.groups[i]
 		label := g
@@ -1874,7 +1921,7 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 	}
 	nameW = mini(nameW, 16)
 
-	start, end := window(m.itemIdx, len(m.items), rows-2)
+	start, end := window(m.itemIdx, len(m.items), rows-2, &m.itemWinStart)
 	for i := start; i < end; i++ {
 		c := m.cmds[m.items[i]]
 		hits := ""

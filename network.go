@@ -32,11 +32,12 @@ type wifiNet struct {
 }
 
 type netState struct {
-	nets    []wifiNet
-	sel     int
-	msg     string
-	radioOn bool
-	noDev   bool // no Wi-Fi device on this machine
+	nets     []wifiNet
+	sel      int
+	winStart int // see window() — persists so scrolling doesn't shift the frame
+	msg      string
+	radioOn  bool
+	noDev    bool // no Wi-Fi device on this machine
 
 	asking bool // password prompt is open
 	pwFor  string
@@ -382,7 +383,7 @@ func (m model) viewNetwork() string {
 	if rows < 3 {
 		rows = 3
 	}
-	start, end := window(s.sel, len(s.nets), rows)
+	start, end := window(s.sel, len(s.nets), rows, &s.winStart)
 	for i := start; i < end; i++ {
 		n := s.nets[i]
 		status := cFant.Render("  ")

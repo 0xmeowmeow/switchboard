@@ -320,6 +320,11 @@ type studyState struct {
 	editing  bool
 	area     textarea.Model
 	msg      string
+
+	// see window()'s own comment — these persist so scrolling either pane
+	// doesn't shift the frame.
+	leftWinStart int
+	mainWinStart int
 }
 
 func newStudyState() *studyState {
@@ -646,7 +651,7 @@ func (m model) viewStudy() string {
 			left = append(left, cDim.Render(line))
 		}
 	}
-	lstart, _ := window(selRow, len(left), rows-2)
+	lstart, _ := window(selRow, len(left), rows-2, &s.leftWinStart)
 	left = clip(left[mini(lstart, len(left)):], rows-2, listW)
 
 	// ---- centre: the lesson
@@ -737,7 +742,7 @@ func (m model) viewStudy() string {
 			main = append(main, "")
 		}
 	}
-	mstart, _ := window(qRow, len(main), rows-2)
+	mstart, _ := window(qRow, len(main), rows-2, &s.mainWinStart)
 	main = clip(main[mini(mstart, len(main)):], rows-2, mainW)
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top,

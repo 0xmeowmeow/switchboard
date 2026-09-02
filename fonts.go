@@ -186,11 +186,12 @@ func buildGroups(all []fontEntry) [][]int {
 // ---------------------------------------------------------------- state
 
 type fontState struct {
-	all     []fontEntry
-	groups  [][]int // each: indices into `all` sharing a font name
-	shown   []int   // indices into `groups`, filtered by query + spellability
-	sel     int
-	variant int // which member of the selected group is being previewed
+	all      []fontEntry
+	groups   [][]int // each: indices into `all` sharing a font name
+	shown    []int   // indices into `groups`, filtered by query + spellability
+	sel      int
+	winStart int // see window() — persists so scrolling doesn't shift the frame
+	variant  int // which member of the selected group is being previewed
 
 	loading bool
 	err     string
@@ -455,7 +456,7 @@ func (m model) viewFonts() string {
 	if len(s.shown) == 0 {
 		list.WriteString(cDim.Render("nothing matches — e changes the preview text"))
 	}
-	start, end := window(s.sel, len(s.shown), listRows)
+	start, end := window(s.sel, len(s.shown), listRows, &s.winStart)
 	for i := start; i < end; i++ {
 		grp := s.groups[s.shown[i]]
 		e := s.all[grp[0]]
