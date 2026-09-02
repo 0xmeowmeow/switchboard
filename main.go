@@ -728,7 +728,6 @@ type mode int
 const (
 	modeList mode = iota
 	modeFilter
-	modeAdd
 	modeConfirmDelete
 	modeGen
 	modeStudy
@@ -768,11 +767,13 @@ type model struct {
 	focus         focus
 	filterText    string
 
-	mode      mode
-	filter    textinput.Model
-	addField  int
-	addBuf    [5]textinput.Model
-	status    string
+	mode       mode
+	filter     textinput.Model
+	addOpen    bool // the add/edit popup floats over whatever mode is underneath, like prefOpen
+	addEditIdx int  // index into m.cmds being edited; -1 means adding a new one
+	addField   int
+	addBuf     [5]textinput.Model
+	status     string
 	quitting  bool
 	chosen    *Cmd
 	h, w      int
@@ -839,7 +840,17 @@ func initialModel() model {
 	labels := []string{"group", "name", "description", "command", "note (optional)"}
 	for i := range m.addBuf {
 		m.addBuf[i] = newInput(labels[i], fmt.Sprintf("  %-16s ", labels[i]+":"), 200)
+		// Capped like the wifi password field elsewhere in this codebase —
+		// but here it's not just about the popup jumping. modalBox's own
+		// pad() measures the whole multi-line body as one string and, if any
+		// line is wider than the box, truncates the WHOLE thing by rune
+		// count — which cuts across line boundaries and can silently drop
+		// later fields entirely, not just widen the popup. Keeping every
+		// field well inside the box means that path never triggers; the
+		// value scrolls internally instead once it's longer than this.
+		m.addBuf[i].Width = 30
 	}
+	m.addEditIdx = -1
 	m.rebuildGroups()
 	m.rebuildItems()
 	return m
@@ -1211,6 +1222,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.prefOpen {
 			return m.updatePrefs(msg)
 		}
+		if m.addOpen {
+			return m.updateAdd(msg)
+		}
 		switch msg.String() {
 		case ",":
 			m.prefOpen = true
@@ -1228,8 +1242,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.mode {
 		case modeFilter:
 			return m.updateFilter(msg)
-		case modeAdd:
-			return m.updateAdd(msg)
 		case modeConfirmDelete:
 			return m.updateConfirm(msg)
 		case modeGen:
@@ -1416,7 +1428,9 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "a":
-		m.mode = modeAdd
+		m.addEditIdx = -1
+		m.resetAddBuf(Cmd{})
+		m.addOpen = true
 		m.addField = 0
 		m.addBuf[0].Focus()
 		m.status = ""
@@ -1429,9 +1443,17 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "e":
-		m.chosen = &Cmd{Name: "__edit__", Run: "${EDITOR:-nano} " + configPath()}
-		m.quitting = true
-		return m, tea.Quit
+		c, ok := m.current()
+		if !ok {
+			return m, nil
+		}
+		m.addEditIdx = m.items[m.itemIdx]
+		m.resetAddBuf(c)
+		m.addOpen = true
+		m.addField = 0
+		m.addBuf[0].Focus()
+		m.status = ""
+		return m, textinput.Blink
 	}
 	return m, nil
 }
@@ -1491,13 +1513,26 @@ func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// resetAddBuf loads c's fields into the add/edit popup's inputs — an empty
+// Cmd{} for "a" (add new), the selected command for "e" (edit in place).
+func (m *model) resetAddBuf(c Cmd) {
+	vals := [5]string{c.Group, c.Name, c.Desc, c.Run, c.Note}
+	for i := range m.addBuf {
+		m.addBuf[i].SetValue(vals[i])
+		m.addBuf[i].Blur()
+	}
+}
+
+// updateAdd drives the add/edit popup — see model.addOpen. It floats over
+// whatever mode was underneath (like prefOpen/diagram), so closing it never
+// needs to restore a mode: the mode never changed in the first place.
 func (m model) updateAdd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		for i := range m.addBuf {
 			m.addBuf[i].Blur()
 		}
-		m.mode = modeList
+		m.addOpen = false
 		m.status = ""
 		return m, nil
 	case "tab", "down":
@@ -1518,24 +1553,30 @@ func (m model) updateAdd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "group, name and command are required"
 			return m, nil
 		}
-		m.cmds = append(m.cmds, Cmd{
+		c := Cmd{
 			Group: g, Name: n,
 			Desc: strings.TrimSpace(m.addBuf[2].Value()),
 			Run:  r,
 			Note: strings.TrimSpace(m.addBuf[4].Value()),
-		})
+		}
+		editing := m.addEditIdx >= 0 && m.addEditIdx < len(m.cmds)
+		if editing {
+			m.cmds[m.addEditIdx] = c
+		} else {
+			m.cmds = append(m.cmds, c)
+		}
 		sortCmds(m.cmds, m.usage)
 		if err := saveCommands(m.cmds); err != nil {
 			m.status = "save failed: " + err.Error()
+		} else if editing {
+			m.status = "updated " + n
 		} else {
 			m.status = "added " + n
 		}
-		for i := range m.addBuf {
-			m.addBuf[i].SetValue("")
-			m.addBuf[i].Blur()
-		}
+		m.resetAddBuf(Cmd{})
 		m.addField = 0
-		m.mode = modeList
+		m.addEditIdx = -1
+		m.addOpen = false
 		m.rebuildGroups()
 		m.rebuildItems()
 		return m, nil
@@ -1676,13 +1717,14 @@ func (m model) View() string {
 	if m.prefOpen {
 		return m.canvas(overlayModal(m.baseView(), m.viewPrefs()))
 	}
+	if m.addOpen {
+		return m.canvas(overlayModal(m.baseView(), m.viewAddModal()))
+	}
 	return m.canvas(m.baseView())
 }
 
 func (m model) baseView() string {
 	switch m.mode {
-	case modeAdd:
-		return m.viewAdd()
 	case modeConfirmDelete:
 		return m.viewConfirm()
 	case modeStudy:
@@ -2041,17 +2083,27 @@ func (m model) renderStatus(w int, inGen bool) string {
 	return left + stMid.Width(fill).Render(body) + right
 }
 
-func (m model) viewAdd() string {
+// viewAddModal is the popup for both "a" (add) and "e" (edit in place) — see
+// model.addOpen. It replaced "e" handing off to $EDITOR on the raw config
+// file: editing a command's fields shouldn't require knowing the file format
+// or leaving sb at all.
+func (m model) viewAddModal() string {
+	w := mini(72, maxi(56, m.w-12))
+	title := "ADD COMMAND"
+	if m.addEditIdx >= 0 {
+		title = "EDIT COMMAND"
+	}
 	var b strings.Builder
-	b.WriteString("\n " + gradient("▌ ADD A COMMAND", true) + "\n\n")
 	for i := range m.addBuf {
-		b.WriteString(m.addBuf[i].View() + "\n")
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(m.addBuf[i].View())
 	}
 	if m.status != "" {
-		b.WriteString("\n  " + cWarn.Render(m.status) + "\n")
+		b.WriteString("\n\n" + cWarn.Render(m.status))
 	}
-	b.WriteString("\n" + cDim.Render("  tab next field   ↵ save   esc cancel") + "\n")
-	return b.String()
+	return modalBox(title, b.String(), "tab next field   ↵ save   esc cancel", w)
 }
 
 func (m model) viewConfirm() string {
