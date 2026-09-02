@@ -222,3 +222,56 @@ func TestNetworkPasswordEntryNoFrameJump(t *testing.T) {
 		}
 	}
 }
+
+// TestBluetoothConnectingNoFrameJump checks the connection progress bar this
+// session added (bluetooth.go's connProg): showing or hiding it, at any
+// percentage, must not change the screen's footprint — the bar's own width
+// is fixed, so this is a real invariant, not a fluke of the test data.
+func TestBluetoothConnectingNoFrameJump(t *testing.T) {
+	m := initialModel()
+	m.w, m.h = 160, 40
+	m.mode = modeBluetooth
+	m.bt = &btState{devices: mkBTDevices(3)}
+
+	idle, idleCw := footprint(m.baseView())
+
+	m.bt.connBusy = true
+	for _, pct := range []float64{0, 0.15, 0.5, 0.99, 1} {
+		m.bt.connProg.SetPercent(pct)
+		n, cw := footprint(m.baseView())
+		if n != idle {
+			t.Errorf("connBusy at %.0f%% changed line count from %d to %d", pct*100, idle, n)
+		}
+		_ = cw // width is expected to differ from idle by the bar's fixed size; only line count must hold
+	}
+	m.bt.connBusy = false
+	n, cw := footprint(m.baseView())
+	if n != idle || cw != idleCw {
+		t.Errorf("clearing connBusy did not restore the idle footprint: got (%d,%d), want (%d,%d)", n, cw, idle, idleCw)
+	}
+}
+
+// TestNetworkConnectingNoFrameJump is TestBluetoothConnectingNoFrameJump's
+// Wi-Fi counterpart.
+func TestNetworkConnectingNoFrameJump(t *testing.T) {
+	m := initialModel()
+	m.w, m.h = 160, 40
+	m.mode = modeNetwork
+	m.net = &netState{radioOn: true, nets: mkNets(3)}
+
+	idle, idleCw := footprint(m.baseView())
+
+	m.net.connBusy = true
+	for _, pct := range []float64{0, 0.15, 0.5, 0.99, 1} {
+		m.net.connProg.SetPercent(pct)
+		n, _ := footprint(m.baseView())
+		if n != idle {
+			t.Errorf("connBusy at %.0f%% changed line count from %d to %d", pct*100, idle, n)
+		}
+	}
+	m.net.connBusy = false
+	n, cw := footprint(m.baseView())
+	if n != idle || cw != idleCw {
+		t.Errorf("clearing connBusy did not restore the idle footprint: got (%d,%d), want (%d,%d)", n, cw, idle, idleCw)
+	}
+}

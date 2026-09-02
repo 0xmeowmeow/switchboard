@@ -16,7 +16,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -40,8 +42,23 @@ type netState struct {
 	pwFor  string
 	pw     textinput.Model
 
+	// connProg is the same staged-progress treatment as bluetooth.go's
+	// connProg: nmcli gives no real percentage, so this jumps to a partial
+	// value the moment an action starts and completes to 100% on
+	// nmActionMsg — an honest "in progress / done" signal, not a fake timer.
+	connProg progress.Model
+	connBusy bool
+
 	proc  *exec.Cmd
 	lines chan string
+}
+
+// netProgDoneMsg clears the progress bar a moment after it reaches 100% — see
+// the matching type in bluetooth.go.
+type netProgDoneMsg struct{}
+
+func netProgDone() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return netProgDoneMsg{} })
 }
 
 func (s *netState) current() *wifiNet {
@@ -202,7 +219,9 @@ func startNmMonitor() (*netState, tea.Cmd) {
 	cmd := exec.Command("nmcli", "monitor")
 	stdout, errOut := cmd.StdoutPipe()
 	lines := make(chan string, 128)
-	s := &netState{lines: lines, proc: cmd, pw: pw}
+	prog := progress.New(progress.WithGradient(themes[curTheme].Accent, themes[curTheme].Second))
+	prog.ShowPercentage = false
+	s := &netState{lines: lines, proc: cmd, pw: pw, connProg: prog}
 
 	if errOut != nil || cmd.Start() != nil {
 		s.msg = "could not start nmcli monitor"
@@ -254,8 +273,9 @@ func (m model) updateNetwork(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.pw.SetValue("")
 			s.pw.Blur()
 			s.msg = "connecting to " + ssid + "…"
-			return m, nmAction("connect "+ssid,
-				"device", "wifi", "connect", ssid, "password", pass)
+			s.connBusy = true
+			return m, tea.Batch(s.connProg.SetPercent(0.35), nmAction("connect "+ssid,
+				"device", "wifi", "connect", ssid, "password", pass))
 		}
 		var cmd tea.Cmd
 		s.pw, cmd = s.pw.Update(msg)
@@ -299,8 +319,9 @@ func (m model) updateNetwork(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				nmAction("down "+d.ssid, "connection", "down", "id", d.ssid), nmPoll())
 		case d.known:
 			s.msg = "connecting to " + d.ssid + "…"
-			return m, tea.Sequence(
-				nmAction("up "+d.ssid, "connection", "up", "id", d.ssid), nmPoll())
+			s.connBusy = true
+			return m, tea.Batch(s.connProg.SetPercent(0.5), tea.Sequence(
+				nmAction("up "+d.ssid, "connection", "up", "id", d.ssid), nmPoll()))
 		case d.secure:
 			s.asking = true
 			s.pwFor = d.ssid
@@ -309,8 +330,9 @@ func (m model) updateNetwork(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		default:
 			s.msg = "connecting to " + d.ssid + "…"
-			return m, tea.Sequence(
-				nmAction("connect "+d.ssid, "device", "wifi", "connect", d.ssid), nmPoll())
+			s.connBusy = true
+			return m, tea.Batch(s.connProg.SetPercent(0.5), tea.Sequence(
+				nmAction("connect "+d.ssid, "device", "wifi", "connect", d.ssid), nmPoll()))
 		}
 	case "r":
 		if d := s.current(); d != nil && d.known {
@@ -395,10 +417,16 @@ func (m model) viewNetwork() string {
 	// truncated to the pane width — see the matching comment in
 	// bluetooth.go's viewBluetooth: an unbounded s.msg (a long SSID) would
 	// otherwise widen this line and shift canvas()'s horizontal centring.
+	// The progress bar's width is fixed, so it changes this line's length by
+	// a constant amount, not a live one.
 	var foot string
-	if s.asking {
+	switch {
+	case s.asking:
 		foot = " " + s.pw.View()
-	} else {
+	case s.connBusy:
+		s.connProg.Width = 20
+		foot = " " + s.connProg.View() + "  " + cWarn.Render(truncate(s.msg, maxi(1, w-28)))
+	default:
 		foot = " " + cWarn.Render(truncate(s.msg, maxi(1, w-6)))
 	}
 

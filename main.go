@@ -35,6 +35,8 @@ import (
 
 	"switchboard/decor"
 
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -748,8 +750,7 @@ type genLevel struct {
 	tmpl   string // raw, not yet substituted
 	parent string // the line chosen one level up  ({^})
 	items  []string
-	shown  []int
-	cursor int
+	list   list.Model // owns navigation, filtering and pagination — see genlist.go
 }
 
 const allGroups = "all"
@@ -896,45 +897,25 @@ func (m *model) top() *genLevel {
 	return &m.stack[len(m.stack)-1]
 }
 
-func (m *model) regenFilter() {
-	lv := m.top()
-	if lv == nil {
-		return
-	}
-	q := strings.ToLower(m.filterText)
-	lv.shown = lv.shown[:0]
-	for i, s := range lv.items {
-		if q == "" || strings.Contains(strings.ToLower(s), q) {
-			lv.shown = append(lv.shown, i)
-		}
-	}
-	if lv.cursor >= len(lv.shown) {
-		lv.cursor = maxi(0, len(lv.shown)-1)
-	}
-}
-
 func (m *model) push(title, listCmd, tmpl, parent string) tea.Cmd {
 	m.stack = append(m.stack, genLevel{title: title, tmpl: tmpl, parent: parent})
 	m.genLoad = true
 	m.mode = modeGen
-	m.filterText = ""
-	m.filter.SetValue("")
 	m.status = ""
 	m.spin.Style = cCool
 	return tea.Batch(runGenerator(listCmd), m.spin.Tick)
 }
 
+// pop leaves the current generator level. It does not need to rebuild
+// anything on the way back to a parent level — that level's list.Model sat
+// untouched in m.stack the whole time, filter and cursor position included.
 func (m *model) pop() {
 	if len(m.stack) > 0 {
 		m.stack = m.stack[:len(m.stack)-1]
 	}
-	m.filterText = ""
-	m.filter.SetValue("")
 	if len(m.stack) == 0 {
 		m.mode = modeList
 		m.rebuildItems()
-	} else {
-		m.regenFilter()
 	}
 }
 
@@ -981,12 +962,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		if len(m.stack) > 0 {
+			_, itemW, rows := m.geometry()
+			for i := range m.stack {
+				m.stack[i].list.SetSize(itemW, maxi(1, rows-2))
+			}
+		}
 		return m, nil
 
 	case btLineMsg:
 		if m.bt != nil {
-			m.bt.applyLine(string(msg))
-			return m, btReadLine(m.bt.lines)
+			progCmd := m.bt.applyLine(string(msg))
+			return m, tea.Batch(btReadLine(m.bt.lines), progCmd)
 		}
 		return m, nil
 
@@ -995,6 +982,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.bt.msg = "bluetoothctl exited"
 		}
 		return m, nil
+
+	case btProgDoneMsg:
+		if m.bt != nil {
+			m.bt.connBusy = false
+		}
+		return m, nil
+
+	case netProgDoneMsg:
+		if m.net != nil {
+			m.net.connBusy = false
+		}
+		return m, nil
+
+	case progress.FrameMsg:
+		var cmds []tea.Cmd
+		if m.bt != nil {
+			pm, cmd := m.bt.connProg.Update(msg)
+			m.bt.connProg = pm.(progress.Model)
+			cmds = append(cmds, cmd)
+		}
+		if m.net != nil {
+			pm, cmd := m.net.connProg.Update(msg)
+			m.net.connProg = pm.(progress.Model)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 
 	case nmLineMsg:
 		if m.net != nil {
@@ -1025,6 +1038,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.net.msg = msg.summary + ": " + msg.err.Error()
 			} else {
 				m.net.msg = msg.summary + " ✓"
+			}
+			if m.net.connBusy {
+				if msg.err != nil {
+					m.net.connBusy = false
+				} else {
+					return m, tea.Batch(m.net.connProg.SetPercent(1), netProgDone())
+				}
 			}
 		}
 		return m, nil
@@ -1138,8 +1158,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		lv.items = msg.items
-		lv.cursor = 0
-		m.regenFilter()
+		lv.list = newGenList(lv.items, lv.title, m.watched, isGen(lv.tmpl))
+		_, itemW, rows := m.geometry()
+		lv.list.SetSize(itemW, maxi(1, rows-2))
 		if len(lv.items) == 0 {
 			name := lv.title
 			m.pop()
@@ -1209,6 +1230,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // filter mode is explicit, which is what frees j/k/h/l for navigation.
+// modeGen no longer routes through here — its own list.Model owns its own
+// fuzzy filter (see genlist.go and updateGen) — so this is only ever reached
+// with an empty m.stack now.
 func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -1221,15 +1245,7 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = modeList
-		if len(m.stack) > 0 {
-			m.mode = modeGen
-			m.regenFilter()
-			if lv := m.top(); lv != nil {
-				lv.cursor = 0
-			}
-		} else {
-			m.rebuildItems()
-		}
+		m.rebuildItems()
 		return m, nil
 	case "enter":
 		m.filter.Blur()
@@ -1241,24 +1257,13 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = modeList
-		if len(m.stack) > 0 {
-			m.mode = modeGen
-		} else {
-			m.focus = focusItems
-		}
+		m.focus = focusItems
 		return m, nil
 	}
 	var cmd tea.Cmd
 	m.filter, cmd = m.filter.Update(msg)
 	m.filterText = m.filter.Value()
-	if len(m.stack) > 0 {
-		m.regenFilter()
-		if lv := m.top(); lv != nil {
-			lv.cursor = 0
-		}
-	} else {
-		m.rebuildItems()
-	}
+	m.rebuildItems()
 	return m, cmd
 }
 
@@ -1407,44 +1412,35 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	lv := m.top()
+	if lv == nil {
+		return m, nil
+	}
+
+	// While the user is typing into the list's own fuzzy filter, every key
+	// goes to it — including ones that are ours otherwise (q, h, w…). list
+	// itself knows to treat "esc" here as "cancel the filter", not "pop".
+	if lv.list.FilterState() == list.Filtering {
+		var cmd tea.Cmd
+		lv.list, cmd = lv.list.Update(msg)
+		return m, cmd
+	}
+
 	switch msg.String() {
 	case "esc", "ctrl+c", "h", "left", "q":
 		m.pop()
 		return m, nil
-	case "/":
-		m.mode = modeFilter
-		m.filter.Focus()
-		return m, textinput.Blink
-	case "k", "up":
-		if lv != nil && lv.cursor > 0 {
-			lv.cursor--
-		}
-		return m, nil
-	case "j", "down":
-		if lv != nil && lv.cursor < len(lv.shown)-1 {
-			lv.cursor++
-		}
-		return m, nil
-	case "g", "home":
-		if lv != nil {
-			lv.cursor = 0
-		}
-		return m, nil
-	case "G", "end":
-		if lv != nil {
-			lv.cursor = maxi(0, len(lv.shown)-1)
-		}
-		return m, nil
 	case "w":
-		if lv != nil && len(lv.shown) > 0 {
-			m.toggleWatched(lv.title, lv.items[lv.shown[lv.cursor]])
+		if it, ok := lv.list.SelectedItem().(genItem); ok {
+			m.toggleWatched(lv.title, it.line)
+			return m, lv.rebuildListItems(m.watched)
 		}
 		return m, nil
 	case "enter", "l", "right":
-		if lv == nil || len(lv.shown) == 0 {
+		it, ok := lv.list.SelectedItem().(genItem)
+		if !ok {
 			return m, nil
 		}
-		line := lv.items[lv.shown[lv.cursor]]
+		line := it.line
 		if isGen(lv.tmpl) { // a template that is itself a generator descends
 			inList, inTmpl := genParts(lv.tmpl)
 			return m, m.push(line, substitute(inList, line, lv.parent), inTmpl, line)
@@ -1461,7 +1457,11 @@ func (m model) updateGen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 	}
-	return m, nil
+	// everything else — j/k/up/down/g/G/pgup/pgdown, and "/" to start
+	// filtering — belongs to the list.
+	var cmd tea.Cmd
+	lv.list, cmd = lv.list.Update(msg)
+	return m, cmd
 }
 
 func (m model) updateAdd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1844,34 +1844,17 @@ func (m model) renderItems(w, rows int, inGen bool) string {
 			b.WriteString(m.spin.View() + cDim.Render(" running the generator…"))
 			return b.String()
 		}
-		if lv == nil || len(lv.shown) == 0 {
+		if lv == nil || len(lv.items) == 0 {
 			b.WriteString(cDim.Render("nothing matches"))
 			return b.String()
 		}
-		nested := isGen(lv.tmpl)
-		start, end := window(lv.cursor, len(lv.shown), rows-2)
-		for i := start; i < end; i++ {
-			line := lv.items[lv.shown[i]]
-			watched := m.watched[watchedKey(lv.title, line)]
-			mark := " "
-			if nested {
-				mark = "›"
-			}
-			check := "  "
-			if watched {
-				check = "✓ "
-			}
-			text := check + pad(truncate(line, w-4), w-4) + " "
-			switch {
-			case i == lv.cursor:
-				b.WriteString(selOn.Render(" "+text) + cPurp.Render(mark))
-			case watched:
-				b.WriteString(" " + cFant.Render(text) + cFant.Render(mark))
-			default:
-				b.WriteString(" " + cBase.Render(text) + cFant.Render(mark))
-			}
-			b.WriteString("\n")
-		}
+		// Fixed height regardless of item count or the live fuzzy filter —
+		// same reasoning as clampLines everywhere else in this file:
+		// list.Model's own View() already pads to exactly this budget, this
+		// is defensive insurance, not the primary mechanism.
+		budget := rows - 2
+		lv.list.SetSize(w, budget)
+		b.WriteString(clampLines(lv.list.View(), budget))
 		return b.String()
 	}
 
@@ -1942,14 +1925,16 @@ func (m model) renderDetail(w int) string {
 	tw := inner - 2 // paneOff padding; lipgloss wraps the body here
 	line1, line2 := "", ""
 
-	if m.mode == modeGen || (m.mode == modeFilter && len(m.stack) > 0) {
+	if m.mode == modeGen {
 		lv := m.top()
-		if lv != nil && len(lv.shown) > 0 {
-			line1 = cBase.Render(truncate(lv.items[lv.shown[lv.cursor]], inner))
-			if isGen(lv.tmpl) {
-				line2 = cPurp.Render("› opens another list")
-			} else {
-				line2 = cDim.Render("↵ runs this")
+		if lv != nil {
+			if it, ok := lv.list.SelectedItem().(genItem); ok {
+				line1 = cBase.Render(truncate(it.line, inner))
+				if isGen(lv.tmpl) {
+					line2 = cPurp.Render("› opens another list")
+				} else {
+					line2 = cDim.Render("↵ runs this")
+				}
 			}
 		}
 	} else if c, ok := m.current(); ok {

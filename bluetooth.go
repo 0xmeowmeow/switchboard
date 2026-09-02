@@ -13,7 +13,9 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -29,9 +31,26 @@ type btState struct {
 	msg      string
 	pairing  string // mac currently being paired, "" if none in flight
 
+	// connProg animates pair→trust→connect as a real, staged progress bar —
+	// not a fake loader: each SetPercent below corresponds to an actual event
+	// bluetoothctl just reported. connBusy is whether it should be drawn at
+	// all; connTarget is the device it's tracking, so an unrelated device's
+	// Connected event mid-scan can't complete someone else's bar.
+	connProg   progress.Model
+	connBusy   bool
+	connTarget string
+
 	proc  *exec.Cmd
 	stdin io.WriteCloser
 	lines chan string
+}
+
+// btProgDoneMsg clears the progress bar a moment after it reaches 100%, so
+// "connected" is visibly felt rather than replaced by the next frame.
+type btProgDoneMsg struct{}
+
+func btProgDone() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return btProgDoneMsg{} })
 }
 
 // visible is paired devices always, plus anything the current scan turned
@@ -137,7 +156,9 @@ func startBluetoothctl() (*btState, tea.Cmd) {
 	stdin, errIn := cmd.StdinPipe()
 	stdout, errOut := cmd.StdoutPipe()
 	lines := make(chan string, 128)
-	s := &btState{proc: cmd, stdin: stdin, lines: lines, devices: seedDevices()}
+	prog := progress.New(progress.WithGradient(themes[curTheme].Accent, themes[curTheme].Second))
+	prog.ShowPercentage = false
+	s := &btState{proc: cmd, stdin: stdin, lines: lines, devices: seedDevices(), connProg: prog}
 	if errIn != nil || errOut != nil {
 		s.msg = "could not start bluetoothctl"
 		close(lines)
@@ -202,24 +223,31 @@ var btKnownProps = map[string]bool{
 // applyLine folds one cleaned line of bluetoothctl output into the device
 // list: a name (from the initial `devices` listing or a scan discovery), a
 // property change (Connected/Paired/Trusted/...), a device disappearing
-// mid-scan, or a pairing outcome that chains trust+connect on success.
-func (s *btState) applyLine(line string) {
+// mid-scan, or a pairing outcome that chains trust+connect on success. The
+// non-nil returns are progress-bar stage transitions — real ones, each tied
+// to an event bluetoothctl just reported, not a fake loader.
+func (s *btState) applyLine(line string) tea.Cmd {
 	switch {
 	case strings.Contains(line, "Pairing successful") && s.pairing != "":
 		s.send("trust " + s.pairing)
 		s.send("connect " + s.pairing)
 		s.msg = "paired — trusting and connecting…"
 		s.pairing = ""
-		return
+		return s.connProg.SetPercent(0.6)
 	case strings.HasPrefix(line, "Failed to pair") && s.pairing != "":
 		s.msg = line
 		s.pairing = ""
-		return
+		s.connBusy = false
+		return nil
+	case (strings.HasPrefix(line, "Failed to connect") || strings.HasPrefix(line, "Failed to disconnect")) && s.connBusy:
+		s.msg = line
+		s.connBusy = false
+		return nil
 	}
 
 	m := btDeviceRE.FindStringSubmatch(line)
 	if m == nil {
-		return
+		return nil
 	}
 	tag, mac, rest := m[1], strings.ToUpper(m[2]), m[3]
 
@@ -233,7 +261,7 @@ func (s *btState) applyLine(line string) {
 			}
 			s.devices = out
 		}
-		return
+		return nil
 	}
 
 	if i := strings.Index(rest, ": "); i >= 0 && btKnownProps[rest[:i]] {
@@ -246,12 +274,15 @@ func (s *btState) applyLine(line string) {
 		switch prop {
 		case "Connected":
 			d.connected = val
+			if val && s.connBusy && mac == s.connTarget {
+				return tea.Batch(s.connProg.SetPercent(1), btProgDone())
+			}
 		case "Paired", "Bonded":
 			d.paired = d.paired || val
 		case "Trusted":
 			d.trusted = val
 		}
-		return
+		return nil
 	}
 
 	// a bare name — from the initial `devices` dump (untagged: bluetoothctl
@@ -264,9 +295,10 @@ func (s *btState) applyLine(line string) {
 		if rest != "" {
 			d.name = rest
 		}
-		return
+		return nil
 	}
 	s.devices = append(s.devices, btDevice{mac: mac, name: rest, paired: tag == ""})
+	return nil
 }
 
 // ---------------------------------------------------------------- update
@@ -309,14 +341,18 @@ func (m model) updateBluetooth(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch {
 		case !d.paired:
 			s.pairing = d.mac
+			s.connBusy, s.connTarget = true, d.mac
 			s.send("pair " + d.mac)
 			s.msg = "pairing " + displayName(d) + "…"
+			return m, s.connProg.SetPercent(0.15)
 		case d.connected:
 			s.send("disconnect " + d.mac)
 			s.msg = "disconnecting " + displayName(d) + "…"
 		default:
+			s.connBusy, s.connTarget = true, d.mac
 			s.send("connect " + d.mac)
 			s.msg = "connecting " + displayName(d) + "…"
+			return m, s.connProg.SetPercent(0.25)
 		}
 	case "r":
 		if d := s.current(); d != nil && d.paired {
@@ -397,8 +433,17 @@ func (m model) viewBluetooth() string {
 
 	// truncated to the pane width: a long device name in s.msg (e.g. mid-pair
 	// or mid-connect) would otherwise widen this line past every other row
-	// and shift canvas()'s horizontal centring — a sideways jump.
-	foot := " " + cWarn.Render(truncate(s.msg, maxi(1, w-6)))
+	// and shift canvas()'s horizontal centring — a sideways jump. The bar's
+	// own width is fixed (never data-dependent), so adding it here changes
+	// this line's length by a constant, known amount — not a live one.
+	foot := " "
+	msgBudget := w - 6
+	if s.connBusy {
+		s.connProg.Width = 20
+		foot += s.connProg.View() + "  "
+		msgBudget -= 22
+	}
+	foot += cWarn.Render(truncate(s.msg, maxi(1, msgBudget)))
 	keys := "↵ pair/connect/disconnect  s scan  r forget  q back"
 	status := stTag.Render("BT") +
 		stMid.Width(maxi(4, w-10)).Render(truncate(cDim.Render(keys), maxi(4, w-14)))
