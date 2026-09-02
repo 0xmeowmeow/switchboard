@@ -46,7 +46,15 @@ func TestEditKeyOpensPopupNotEditor(t *testing.T) {
 // TestEditSavesInPlace checks editing a command replaces it rather than
 // appending a duplicate, and that the popup closes (addOpen false) with the
 // underlying mode untouched.
+//
+// This test's "enter" reaches updateAdd's save path, which calls
+// saveCommands — a real write to ~/.config/switchboard/commands.conf. HOME
+// is isolated to a throwaway dir for exactly that reason: this test ran
+// without it once, on 2026-09-02, and overwrote the real config with its
+// two-line fixture. Recovered from a stale backup plus session notes; never
+// again — every test whose path can reach a save/write must isolate HOME.
 func TestEditSavesInPlace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	m := initialModel()
 	m.cmds = []Cmd{
 		{Group: "system", Name: "apps", Desc: "old desc", Run: "old-run"},
