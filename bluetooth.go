@@ -384,9 +384,21 @@ func (m model) viewBluetooth() string {
 		list.WriteString("\n")
 	}
 
-	body := paneOn.Width(w - 2).Render(list.String())
+	// The pane must render to a FIXED height regardless of how many devices
+	// are visible — lipgloss .Height() only pads a shorter block, it never
+	// truncates a taller one, so without clampLines a device list longer than
+	// `budget` would grow the pane past it. A body whose height tracks the
+	// live device count (short with nothing paired, tall mid-scan) shifts
+	// canvas()'s vertical placement on every device found or lost — the
+	// frame visibly jumps, worse here than anywhere else in sb because this
+	// list's length swings the most. Same fix as viewMain's rail/items panes.
+	budget := rows + 2 // paneTitle's 2 lines + up to `rows` device lines
+	body := paneOn.Width(w - 2).Height(budget).Render(clampLines(list.String(), budget))
 
-	foot := " " + cWarn.Render(s.msg)
+	// truncated to the pane width: a long device name in s.msg (e.g. mid-pair
+	// or mid-connect) would otherwise widen this line past every other row
+	// and shift canvas()'s horizontal centring — a sideways jump.
+	foot := " " + cWarn.Render(truncate(s.msg, maxi(1, w-6)))
 	keys := "↵ pair/connect/disconnect  s scan  r forget  q back"
 	status := stTag.Render("BT") +
 		stMid.Width(maxi(4, w-10)).Render(truncate(cDim.Render(keys), maxi(4, w-14)))

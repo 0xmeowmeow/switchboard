@@ -495,9 +495,17 @@ func (m model) viewFonts() string {
 		}
 	}
 
+	// Both panes must render to a FIXED height, same reasoning as the
+	// clampLines comment on viewMain's rail/items panes: without it, a font
+	// with a taller glyph height than the last one selected grows the
+	// preview pane and the whole frame jumps as you browse. A font taller
+	// than the budget below gets its bottom rows clipped rather than
+	// reflowing the screen — same trade sb already makes for a long
+	// description in the detail strip.
+	budget := listRows + 2 // paneTitle's 2 lines + up to `listRows` content lines
 	body := lipgloss.JoinVertical(lipgloss.Left,
-		paneOn.Width(w-2).Render(list.String()),
-		paneOff.Width(w-2).Render(prev.String()),
+		paneOn.Width(w-2).Height(budget).Render(clampLines(list.String(), budget)),
+		paneOff.Width(w-2).Height(budget).Render(clampLines(prev.String(), budget)),
 	)
 
 	foot := " " + cBase.Render("text: ") + cCool.Render(s.text)

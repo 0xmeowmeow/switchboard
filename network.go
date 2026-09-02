@@ -192,6 +192,12 @@ func startNmMonitor() (*netState, tea.Cmd) {
 	pw.Prompt = "  password  "
 	pw.EchoMode = textinput.EchoPassword
 	pw.CharLimit = 128
+	// Capped so the input scrolls internally instead of growing the footer
+	// line wider than the pane as you type — an unbounded textinput.View()
+	// would otherwise widen the screen's footprint keystroke by keystroke,
+	// which shifts canvas()'s horizontal centring, i.e. the frame "jumps"
+	// while you are mid-password.
+	pw.Width = 24
 
 	cmd := exec.Command("nmcli", "monitor")
 	stdout, errOut := cmd.StdoutPipe()
@@ -379,13 +385,21 @@ func (m model) viewNetwork() string {
 		list.WriteString("\n")
 	}
 
-	body := paneOn.Width(w - 2).Render(list.String())
+	// Fixed height regardless of how many networks are visible — see the
+	// matching comment in bluetooth.go's viewBluetooth. Without this, a scan
+	// that finds more or fewer SSIDs grows or shrinks the pane and the whole
+	// frame jumps.
+	budget := rows + 2 // paneTitle's 2 lines + up to `rows` network lines
+	body := paneOn.Width(w - 2).Height(budget).Render(clampLines(list.String(), budget))
 
+	// truncated to the pane width — see the matching comment in
+	// bluetooth.go's viewBluetooth: an unbounded s.msg (a long SSID) would
+	// otherwise widen this line and shift canvas()'s horizontal centring.
 	var foot string
 	if s.asking {
 		foot = " " + s.pw.View()
 	} else {
-		foot = " " + cWarn.Render(s.msg)
+		foot = " " + cWarn.Render(truncate(s.msg, maxi(1, w-6)))
 	}
 
 	keys := "↵ connect/disconnect  s rescan  t radio  r forget  q back"
